@@ -8,15 +8,8 @@ public class SyncConfig {
     public static final ModConfigSpec SPEC;
     public static final SyncConfig INSTANCE;
 
-    public final ModConfigSpec.ConfigValue<String> mysqlHost;
-    public final ModConfigSpec.IntValue mysqlPort;
-    public final ModConfigSpec.ConfigValue<String> mysqlDatabase;
-    public final ModConfigSpec.ConfigValue<String> mysqlUsername;
-    public final ModConfigSpec.ConfigValue<String> mysqlPassword;
-
-    public final ModConfigSpec.IntValue poolMaxSize;
-    public final ModConfigSpec.IntValue poolMinIdle;
-    public final ModConfigSpec.IntValue connectionTimeout;
+    public final ModConfigSpec.ConfigValue<String> mongoUri;
+    public final ModConfigSpec.ConfigValue<String> mongoDatabase;
 
     public final ModConfigSpec.ConfigValue<String> inventoryScope;
     public final ModConfigSpec.ConfigValue<String> serverName;
@@ -33,22 +26,15 @@ public class SyncConfig {
 
     private SyncConfig(ModConfigSpec.Builder builder) {
         builder.comment("Database");
-        builder.push("mysql");
+        builder.push("mongodb");
 
-        mysqlHost = builder.define("host", "127.0.0.1");
-        mysqlPort = builder.defineInRange("port", 3306, 1, 65535);
-        mysqlDatabase = builder.define("database", "cretania");
-        mysqlUsername = builder.define("username", "cretania_user");
-        mysqlPassword = builder.define("password", "change_me");
+        mongoUri = builder
+                .comment("URI de conexión a MongoDB. Ejemplo: mongodb://usuario:contraseña@127.0.0.1:27017/cretania")
+                .define("uri", "mongodb://127.0.0.1:27017");
 
-        builder.pop();
-
-        builder.comment("Connection pool");
-        builder.push("pool");
-
-        poolMaxSize = builder.defineInRange("maxSize", 10, 2, 50);
-        poolMinIdle = builder.defineInRange("minIdle", 2, 1, 10);
-        connectionTimeout = builder.defineInRange("connectionTimeout", 5000, 1000, 30000);
+        mongoDatabase = builder
+                .comment("Nombre de la base de datos MongoDB.")
+                .define("database", "cretania");
 
         builder.pop();
 

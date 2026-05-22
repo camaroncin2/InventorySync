@@ -32,21 +32,30 @@ neoForge {
 }
 
 dependencies {
-    // HikariCP - Pool de conexiones asíncrono para MySQL
-    implementation "com.zaxxer:HikariCP:${project.property('hikaricp_version')}"
-    jarJar("com.zaxxer:HikariCP") {
+    // MongoDB Sync Driver
+    implementation "org.mongodb:mongodb-driver-sync:${project.property('mongodb_driver_version')}"
+    jarJar("org.mongodb:mongodb-driver-sync") {
         version {
             strictly "[5.0,6)"
-            prefer "${project.property('hikaricp_version')}"
+            prefer "${project.property('mongodb_driver_version')}"
         }
     }
 
-    // MySQL Connector/J
-    implementation "com.mysql:mysql-connector-j:${project.property('mysql_connector_version')}"
-    jarJar("com.mysql:mysql-connector-j") {
+    // MongoDB Driver Core (transitiva, pero declarada explícitamente para jarJar)
+    implementation "org.mongodb:mongodb-driver-core:${project.property('mongodb_driver_version')}"
+    jarJar("org.mongodb:mongodb-driver-core") {
         version {
-            strictly "[8.0,9)"
-            prefer "${project.property('mysql_connector_version')}"
+            strictly "[5.0,6)"
+            prefer "${project.property('mongodb_driver_version')}"
+        }
+    }
+
+    // BSON (transitiva, pero declarada explícitamente para jarJar)
+    implementation "org.mongodb:bson:${project.property('mongodb_driver_version')}"
+    jarJar("org.mongodb:bson") {
+        version {
+            strictly "[5.0,6)"
+            prefer "${project.property('mongodb_driver_version')}"
         }
     }
 }

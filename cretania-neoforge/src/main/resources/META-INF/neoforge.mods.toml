@@ -9,7 +9,7 @@ displayName = "Cretania Sync"
 displayTest = "IGNORE_ALL_VERSION"
 description = '''
 Sistema de sincronización de datos de jugador (inventario, vida, XP, Capabilities) 
-100% Server-Side para la red Cretania. Utiliza MySQL con HikariCP.
+100% Server-Side para la red Cretania. Utiliza MongoDB.
 '''
 
 [[dependencies.cretaniasync]]

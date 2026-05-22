@@ -20,7 +20,7 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Clase principal del mod Cretania Sync (NeoForge).
- * Se encarga de inicializar la conexión a MySQL, registrar los listeners de eventos
+ * Se encarga de inicializar la conexión a MongoDB, registrar los listeners de eventos
  * y el canal de red "cretania:sync".
  */
 @Mod(CretaniaSync.MOD_ID)
@@ -69,7 +69,7 @@ public class CretaniaSync {
     }
 
     /**
-     * Al iniciar el servidor: conectar a MySQL.
+     * Al iniciar el servidor: conectar a MongoDB.
      */
     @SubscribeEvent
     public void onServerStarting(ServerStartingEvent event) {
@@ -82,24 +82,18 @@ public class CretaniaSync {
         SyncConfig config = SyncConfig.INSTANCE;
         try {
             databaseManager.initialize(
-                    config.mysqlHost.get(),
-                    config.mysqlPort.get(),
-                    config.mysqlDatabase.get(),
-                    config.mysqlUsername.get(),
-                    config.mysqlPassword.get(),
-                    config.poolMaxSize.get(),
-                    config.poolMinIdle.get(),
-                    config.connectionTimeout.get()
+                    config.mongoUri.get(),
+                    config.mongoDatabase.get()
             );
-            LOGGER.info("[Cretania] Conexión a MySQL establecida correctamente.");
+            LOGGER.info("[Cretania] Conexión a MongoDB establecida correctamente.");
         } catch (Exception e) {
-            LOGGER.error("[Cretania] FALLO CRÍTICO: No se pudo conectar a MySQL: {}", e.getMessage());
+            LOGGER.error("[Cretania] FALLO CRÍTICO: No se pudo conectar a MongoDB: {}", e.getMessage());
             LOGGER.error("[Cretania] El servidor NO sincronizará datos. Revise la configuración.");
         }
     }
 
     /**
-     * Al detener el servidor: cerrar conexiones MySQL.
+     * Al detener el servidor: cerrar conexión MongoDB.
      */
     @SubscribeEvent
     public void onServerStopping(ServerStoppingEvent event) {
