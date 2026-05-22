@@ -1,0 +1,52 @@
+plugins {
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.42-beta'
+}
+
+version = project.property('mod_version')
+group = project.property('mod_group')
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://maven.neoforged.net/releases' }
+}
+
+base {
+    archivesName = 'cretania-neoforge'
+}
+
+neoForge {
+    version = project.property('neoforge_version')
+
+    runs {
+        server {
+            server()
+        }
+    }
+
+    mods {
+        "${project.property('mod_id')}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+dependencies {
+    // HikariCP - Pool de conexiones asíncrono para MySQL
+    implementation "com.zaxxer:HikariCP:${project.property('hikaricp_version')}"
+    jarJar("com.zaxxer:HikariCP") {
+        version {
+            strictly "[5.0,6)"
+            prefer "${project.property('hikaricp_version')}"
+        }
+    }
+
+    // MySQL Connector/J
+    implementation "com.mysql:mysql-connector-j:${project.property('mysql_connector_version')}"
+    jarJar("com.mysql:mysql-connector-j") {
+        version {
+            strictly "[8.0,9)"
+            prefer "${project.property('mysql_connector_version')}"
+        }
+    }
+}

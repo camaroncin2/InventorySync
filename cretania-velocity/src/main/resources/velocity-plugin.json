@@ -1,0 +1,8 @@
+{
+  "id": "cretania-velocity-sync",
+  "name": "Cretania Velocity Sync",
+  "version": "1.0.0",
+  "description": "Coordinador de sincronización de datos entre servidores Cretania",
+  "authors": ["Cretania Team"],
+  "main": "com.cretania.velocitysync.CretaniaVelocityPlugin"
+}

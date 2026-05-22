@@ -1,0 +1,34 @@
+plugins {
+    id 'java'
+}
+
+version = project.property('mod_version')
+group = project.property('mod_group')
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'papermc'
+        url = 'https://repo.papermc.io/repository/maven-public/'
+    }
+}
+
+base {
+    archivesName = 'cretania-velocity'
+}
+
+dependencies {
+    // Velocity API
+    compileOnly "com.velocitypowered:velocity-api:${project.property('velocity_api_version')}"
+    annotationProcessor "com.velocitypowered:velocity-api:${project.property('velocity_api_version')}"
+}
+
+tasks.named('jar') {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes([
+            'Implementation-Title'  : 'Cretania Velocity Sync',
+            'Implementation-Version': project.version,
+        ])
+    }
+}

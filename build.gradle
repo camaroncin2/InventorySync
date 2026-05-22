@@ -1,0 +1,23 @@
+// Cretania - Root Build File
+// Proyecto multi-módulo: cretania-neoforge + cretania-velocity
+
+subprojects {
+    apply plugin: 'java'
+
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(project.property('java_version') as int)
+        }
+    }
+
+    repositories {
+        mavenCentral()
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+    }
+
+    group = project.property('mod_group')
+    version = project.property('mod_version')
+}

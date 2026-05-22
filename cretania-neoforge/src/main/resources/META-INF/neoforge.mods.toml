@@ -1,0 +1,27 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "All Rights Reserved"
+
+[[mods]]
+modId = "cretaniasync"
+version = "${file.jarVersion}"
+displayName = "Cretania Sync"
+displayTest = "IGNORE_ALL_VERSION"
+description = '''
+Sistema de sincronización de datos de jugador (inventario, vida, XP, Capabilities) 
+100% Server-Side para la red Cretania. Utiliza MySQL con HikariCP.
+'''
+
+[[dependencies.cretaniasync]]
+modId = "neoforge"
+type = "required"
+versionRange = "[21.1,)"
+ordering = "NONE"
+side = "SERVER"
+
+[[dependencies.cretaniasync]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1,)"
+ordering = "NONE"
+side = "SERVER"
