@@ -1,0 +1,27 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "All Rights Reserved"
+
+[[mods]]
+modId = "cretania_client"
+version = "${file.jarVersion}"
+displayName = "Cretania Client"
+displayTest = "IGNORE_ALL_VERSION"
+description = '''
+Mod cliente de la red Cretania: gestiona skins premium de forma instantanea
+sin entity-respawn. Compatible con cualquier servidor NeoForge de Cretania.
+'''
+
+[[dependencies.cretania_client]]
+modId = "neoforge"
+type = "required"
+versionRange = "[21.1,)"
+ordering = "NONE"
+side = "CLIENT"
+
+[[dependencies.cretania_client]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1,1.22)"
+ordering = "NONE"
+side = "CLIENT"

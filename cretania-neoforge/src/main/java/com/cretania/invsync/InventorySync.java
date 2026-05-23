@@ -6,8 +6,16 @@ import com.cretania.invsync.database.NbtSerializer;
 import com.cretania.invsync.logic.SyncStateManager;
 import com.cretania.invsync.network.SyncChannelHandler;
 import com.cretania.invsync.visual.SyncVisuals;
+import com.cretania.invsync.network.SkinClientPayload;
+import com.mojang.authlib.GameProfile;
+import com.mojang.authlib.properties.Property;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
+import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
+import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
+import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
+import net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -16,6 +24,7 @@ import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -38,12 +47,27 @@ public class InventorySync {
     public void onPlayerLogIn(PlayerEvent.PlayerLoggedInEvent event) {
         if (!(event.getEntity() instanceof ServerPlayer player)) return;
         if (!CretaniaSync.getInstance().isDedicatedServer()) return;
+
+        // Notificar a Velocity que el backend tiene al jugador registrado.
+        // Velocity responde inmediatamente con skin + auth — sin delays fijos.
+        SyncChannelHandler.sendPlayerReady(player);
+
         if (!databaseManager.isConnected()) {
             handleDatabaseUnavailable(player);
             return;
         }
 
         this.server = player.getServer();
+
+        // Aplicar posición pendiente de zona (transferencia lobby→tiendas/minijuegos).
+        // Se ejecuta aquí porque PlayerLoggedInEvent garantiza que el jugador está en el mundo.
+        double[] pendingPos = SyncChannelHandler.PENDING_TELEPORTS.remove(player.getUUID());
+        if (pendingPos != null) {
+            SyncChannelHandler.applyTeleport(player,
+                    pendingPos[0], pendingPos[1], pendingPos[2],
+                    (float) pendingPos[3], (float) pendingPos[4]);
+        }
+
         String scope = configuredScope();
         if (scope.isBlank()) {
             CretaniaSync.LOGGER.info("[Cretania] Servidor sin inventoryScope; no se carga inventario compartido para {}.",
@@ -54,14 +78,10 @@ public class InventorySync {
 
         UUID uuid = player.getUUID();
         SyncStateManager.lock(uuid);
-        SyncVisuals.applyLoadingVisuals(player);
-
-        if (SyncConfig.INSTANCE.waitForProxyCoordinator.get()) {
-            pendingProxyDecision.put(uuid, scope);
-            scheduleCoordinatorTimeout(uuid, player.getGameProfile().getName());
-        } else {
-            loadPlayerFromDatabase(player, scope);
-        }
+        // Cargamos directamente desde MongoDB sin esperar al coordinador Velocity.
+        // El logout usa .join() (bloquea) así que el save siempre termina antes
+        // de que el jugador llegue al siguiente servidor — no hay race condition.
+        loadPlayerFromDatabase(player, scope);
     }
 
     @SubscribeEvent
@@ -282,5 +302,72 @@ public class InventorySync {
             player.setDeltaMovement(deltaMovement);
             player.hurtMarked = true;
         }
+    }
+
+    /**
+     * Llamado cuando Velocity envía un mensaje SKIN:<uuid>:<value>:<signature>.
+     *
+     * Estrategia en dos capas:
+     * 1. S2C SkinClientPayload → clientes con cretania-client lo aplican instantáneamente
+     *    sin entity-respawn (incluyendo la vista propia del jugador en F5).
+     * 2. PlayerInfoRemove+Update + entity-respawn para OTROS → fallback para clientes
+     *    sin el mod cliente, garantizando que todos vean la skin correcta.
+     */
+    public void applyPlayerSkin(UUID uuid, String value, String signature) {
+        if (server == null) return;
+        ServerPlayer player = server.getPlayerList().getPlayer(uuid);
+        if (player == null) return;
+
+        server.execute(() -> {
+            if (player.hasDisconnected()) return;
+
+            // 1. Inyectar en el GameProfile del backend (para jugadores que se unan después)
+            GameProfile profile = player.getGameProfile();
+            profile.getProperties().removeAll("textures");
+            if (signature != null && !signature.isBlank()) {
+                profile.getProperties().put("textures", new Property("textures", value, signature));
+            } else {
+                profile.getProperties().put("textures", new Property("textures", value));
+            }
+
+            // 2. Enviar SkinClientPayload a TODOS los clientes conectados.
+            //    cretania-client lo procesa instantáneamente (incluida la vista propia).
+            var skinClientPayload = new SkinClientPayload(uuid, value, signature);
+            for (ServerPlayer other : server.getPlayerList().getPlayers()) {
+                other.connection.send(new ClientboundCustomPayloadPacket(skinClientPayload));
+            }
+
+            // 3. Fallback para clientes sin cretania-client: PlayerInfo update + entity-respawn
+            //    a los OTROS jugadores. El propio jugador NO recibe RemoveEntities/AddEntity
+            //    porque eso congela el cliente (LocalPlayer queda fuera del level).
+            var removePacket = new ClientboundPlayerInfoRemovePacket(List.of(uuid));
+            var addPacket = new ClientboundPlayerInfoUpdatePacket(
+                    java.util.EnumSet.of(
+                            ClientboundPlayerInfoUpdatePacket.Action.ADD_PLAYER,
+                            ClientboundPlayerInfoUpdatePacket.Action.UPDATE_GAME_MODE,
+                            ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LISTED,
+                            ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LATENCY
+                    ),
+                    java.util.List.of(player)
+            );
+
+            for (ServerPlayer other : server.getPlayerList().getPlayers()) {
+                other.connection.send(removePacket);
+                other.connection.send(addPacket);
+                if (!other.getUUID().equals(uuid)) {
+                    other.connection.send(new ClientboundRemoveEntitiesPacket(player.getId()));
+                    other.connection.send(new ClientboundAddEntityPacket(
+                            player.getId(), uuid,
+                            player.getX(), player.getY(), player.getZ(),
+                            player.getXRot(), player.getYRot(),
+                            player.getType(), 0,
+                            player.getDeltaMovement(), player.getYHeadRot()
+                    ));
+                }
+            }
+
+            CretaniaSync.LOGGER.info("[Cretania] Skin aplicada para {} y difundida a {} clientes",
+                    player.getGameProfile().getName(), server.getPlayerList().getPlayers().size());
+        });
     }
 }

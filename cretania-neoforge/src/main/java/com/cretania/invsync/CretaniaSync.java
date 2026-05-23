@@ -3,9 +3,13 @@ package com.cretania.invsync;
 import com.cretania.invsync.config.SyncConfig;
 import com.cretania.invsync.database.DatabaseManager;
 import com.cretania.invsync.logic.SyncStateManager;
+import com.cretania.invsync.network.SkinClientPayload;
 import com.cretania.invsync.network.SyncChannelHandler;
 import com.cretania.invsync.network.SyncPayload;
+import com.cretania.invsync.zone.ReturnZoneManager;
+import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
+import net.neoforged.fml.loading.FMLEnvironment;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.common.Mod;
@@ -13,6 +17,7 @@ import net.neoforged.fml.config.ModConfig;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.server.ServerStartingEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
+import net.minecraft.server.MinecraftServer;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.network.registration.PayloadRegistrar;
 import org.slf4j.Logger;
@@ -34,6 +39,7 @@ public class CretaniaSync {
     private final InventorySync inventorySync;
     private final SyncStateManager syncStateManager;
     private boolean dedicatedServer = false;
+    private MinecraftServer server;
 
     public CretaniaSync(IEventBus modEventBus, ModContainer modContainer) {
         instance = this;
@@ -51,6 +57,8 @@ public class CretaniaSync {
         NeoForge.EVENT_BUS.register(this);
         NeoForge.EVENT_BUS.register(inventorySync);
         NeoForge.EVENT_BUS.register(syncStateManager);
+        // Zona de retorno: detecta cuando un jugador sale de la zona de este servidor
+        NeoForge.EVENT_BUS.addListener(ReturnZoneManager::onServerTick);
 
         // Registrar payload de red en el mod event bus
         modEventBus.addListener(this::onRegisterPayloads);
@@ -58,6 +66,8 @@ public class CretaniaSync {
 
     /**
      * Registra el payload personalizado para el canal cretania:sync.
+     * En servidor dedicado también registra cretania:client_skin (S2C)
+     * para que el mod cliente pueda aplicar skins premium sin entity-respawn.
      */
     private void onRegisterPayloads(RegisterPayloadHandlersEvent event) {
         PayloadRegistrar registrar = event.registrar("1").optional();
@@ -66,6 +76,14 @@ public class CretaniaSync {
                 SyncPayload.STREAM_CODEC,
                 (payload, context) -> SyncChannelHandler.handleIncomingMessage(payload.data())
         );
+        // S2C: solo en servidor dedicado para evitar conflicto con cretania-client en singleplayer
+        if (FMLEnvironment.dist == Dist.DEDICATED_SERVER) {
+            registrar.playToClient(
+                    SkinClientPayload.TYPE,
+                    SkinClientPayload.STREAM_CODEC,
+                    (payload, context) -> {} // el servidor solo envía, nunca recibe este payload
+            );
+        }
     }
 
     /**
@@ -74,6 +92,7 @@ public class CretaniaSync {
     @SubscribeEvent
     public void onServerStarting(ServerStartingEvent event) {
         dedicatedServer = event.getServer().isDedicatedServer();
+        this.server = event.getServer();
         if (!dedicatedServer) {
             LOGGER.info("[Cretania] Servidor integrado (singleplayer) detectado. Sincronización desactivada.");
             return;
@@ -90,6 +109,9 @@ public class CretaniaSync {
             LOGGER.error("[Cretania] FALLO CRÍTICO: No se pudo conectar a MongoDB: {}", e.getMessage());
             LOGGER.error("[Cretania] El servidor NO sincronizará datos. Revise la configuración.");
         }
+
+        // Inicializar la zona de retorno (si hay config)
+        ReturnZoneManager.init(event.getServer());
     }
 
     /**
@@ -103,6 +125,10 @@ public class CretaniaSync {
 
     public static CretaniaSync getInstance() {
         return instance;
+    }
+
+    public MinecraftServer getServer() {
+        return server;
     }
 
     public boolean isDedicatedServer() {

@@ -54,8 +54,8 @@ public class SyncConfig {
                 .define("serverName", "unknown");
 
         waitForProxyCoordinator = builder
-                .comment("Keep enabled when this server is behind Velocity.")
-                .define("waitForProxyCoordinator", true);
+                .comment("Deprecated: loading is now always done directly from MongoDB. This option is ignored.")
+                .define("waitForProxyCoordinator", false);
 
         clearInventoryWhenNotSynced = builder
                 .comment("Clear inventory when this server must not receive a shared inventory.")

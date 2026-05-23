@@ -9,3 +9,4 @@ rootProject.name = 'cretania'
 
 include 'cretania-neoforge'
 include 'cretania-velocity'
+include 'cretania-client'

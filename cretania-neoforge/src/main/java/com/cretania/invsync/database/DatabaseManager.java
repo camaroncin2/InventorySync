@@ -37,11 +37,6 @@ public class DatabaseManager {
 
     public CompletableFuture<Void> savePlayerData(UUID uuid, String playerName, String base64Nbt, String serverName, String inventoryScope) {
         return CompletableFuture.runAsync(() -> {
-            Document filter = Filters.and(
-                    Filters.eq("uuid", uuid.toString()),
-                    Filters.eq("inventoryScope", inventoryScope)
-            ).toBsonDocument();
-
             Document doc = new Document("uuid", uuid.toString())
                     .append("inventoryScope", inventoryScope)
                     .append("playerName", playerName)

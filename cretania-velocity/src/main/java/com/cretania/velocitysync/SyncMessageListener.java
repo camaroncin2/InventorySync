@@ -22,25 +22,32 @@ public class SyncMessageListener {
     private final ProxyServer proxy;
     private final Logger logger;
     private final InventoryGroupConfig groupConfig;
+    private final AuthProfileListener authProfileListener;
 
-    public SyncMessageListener(ProxyServer proxy, Logger logger, InventoryGroupConfig groupConfig) {
+    public SyncMessageListener(ProxyServer proxy, Logger logger, InventoryGroupConfig groupConfig,
+                               AuthProfileListener authProfileListener) {
         this.proxy = proxy;
         this.logger = logger;
         this.groupConfig = groupConfig;
+        this.authProfileListener = authProfileListener;
     }
 
     @Subscribe
     public void onPluginMessage(PluginMessageEvent event) {
-        if (!event.getIdentifier().equals(CretaniaVelocityPlugin.SYNC_CHANNEL)) return;
-
         if (!(event.getSource() instanceof ServerConnection source)) {
-            logger.warn("[Cretania] Mensaje rechazado: origen no es una conexion de servidor.");
-            return;
+            return; // sólo mensajes provenientes de backends
         }
 
-        event.setResult(PluginMessageEvent.ForwardResult.handled());
-        String message = decodeMessage(event.getData());
-        handleMessage(message, source);
+        if (event.getIdentifier().equals(CretaniaVelocityPlugin.SYNC_CHANNEL)) {
+            event.setResult(PluginMessageEvent.ForwardResult.handled());
+            String message = decodeMessage(event.getData());
+            handleMessage(message, source);
+        } else if (event.getIdentifier().equals(CretaniaVelocityPlugin.AUTH_CHANNEL)) {
+            // Canal authmod:check: el lobby notifica skins cracked (CRACKED_SKIN)
+            event.setResult(PluginMessageEvent.ForwardResult.handled());
+            String message = decodeMessage(event.getData());
+            handleAuthChannelMessage(message);
+        }
     }
 
     private void handleMessage(String message, ServerConnection source) {
@@ -52,8 +59,80 @@ public class SyncMessageListener {
 
         if (MSG_SAVE_COMPLETE.equals(parts[0])) {
             handleSaveComplete(parts[1], parts.length > 2 ? parts[2] : "unknown", parts.length > 3 ? parts[3] : "", source);
+        } else if ("PLAYER_READY".equals(parts[0])) {
+            handlePlayerReady(parts[1], source.getServerInfo().getName(), source);
         } else {
             logger.warn("[Cretania] Tipo de mensaje desconocido: {}", parts[0]);
+        }
+    }
+
+    /**
+     * Maneja mensajes del canal authmod:check provenientes del backend (lobby).
+     * Protocolos soportados:
+     *   CRACKED_SKIN:<uuid>:<value>:<signature>
+     *   TRANSFER:<uuid>:<serverName>
+     */
+    private void handleAuthChannelMessage(String message) {
+        if (message.startsWith("CRACKED_SKIN:")) {
+            // value/sig pueden contener ':' internamente → split límite 4
+            String[] parts = message.split(":", 4);
+            if (parts.length == 4) {
+                String uuidStr   = parts[1];
+                String value     = parts[2];
+                String signature = parts[3];
+                try {
+                    UUID uuid = UUID.fromString(uuidStr);
+                    proxy.getPlayer(uuid).ifPresent(player -> {
+                        authProfileListener.setCrackedSkin(
+                                player.getUsername(),
+                                new MojangAPI.SkinProperty(value, signature)
+                        );
+                        logger.info("[Cretania-Skin] CRACKED_SKIN recibida y cacheada para {}", player.getUsername());
+                    });
+                } catch (IllegalArgumentException e) {
+                    logger.warn("[Cretania-Skin] UUID invalido en CRACKED_SKIN: {}", uuidStr);
+                }
+            }
+        } else if (message.startsWith("TRANSFER:")) {
+            // TRANSFER:<uuid>:<serverName>[:<x>:<y>:<z>:<yaw>:<pitch>]
+            String[] parts = message.split(":", 8);
+            if (parts.length >= 3) {
+                String uuidStr    = parts[1];
+                String serverName = parts[2];
+                try {
+                    UUID uuid = UUID.fromString(uuidStr);
+                    if (parts.length == 8) {
+                        double x = Double.parseDouble(parts[3]);
+                        double y = Double.parseDouble(parts[4]);
+                        double z = Double.parseDouble(parts[5]);
+                        float yaw = Float.parseFloat(parts[6]);
+                        float pitch = Float.parseFloat(parts[7]);
+                        TransferSocketServer.PENDING_POSITIONS.put(uuid,
+                                new TransferSocketServer.PositionData(serverName, x, y, z, yaw, pitch));
+                    }
+                    proxy.getPlayer(uuid).ifPresent(player ->
+                            proxy.getServer(serverName).ifPresentOrElse(
+                                    server -> {
+                                        player.createConnectionRequest(server).connect()
+                                                .whenComplete((result, ex) -> {
+                                                    if (ex != null) {
+                                                        logger.warn("[Cretania-Zone] Error al transferir {} → {}: {}",
+                                                                player.getUsername(), serverName, ex.getMessage());
+                                                    } else {
+                                                        logger.info("[Cretania-Zone] {} transferido a {}",
+                                                                player.getUsername(), serverName);
+                                                    }
+                                                });
+                                    },
+                                    () -> logger.warn("[Cretania-Zone] Servidor '{}' no encontrado en Velocity (TRANSFER ignorado)", serverName)
+                            )
+                    );
+                } catch (IllegalArgumentException e) {
+                    logger.warn("[Cretania-Zone] UUID invalido en TRANSFER: {}", uuidStr);
+                }
+            }
+        } else {
+            logger.warn("[Cretania] Mensaje authmod:check desconocido desde backend: {}", message);
         }
     }
 
@@ -112,6 +191,40 @@ public class SyncMessageListener {
         }
 
         PlayerSyncState.clear(uuid);
+    }
+
+    /**
+     * Responde inmediatamente al PLAYER_READY del backend enviando skin + auth sin delays.
+     * El backend dispara PLAYER_READY en PlayerLoggedInEvent — jugador ya registrado.
+     */
+    private void handlePlayerReady(String uuidStr, String serverName, ServerConnection source) {
+        UUID uuid;
+        try {
+            uuid = UUID.fromString(uuidStr);
+        } catch (IllegalArgumentException e) {
+            logger.warn("[Cretania-Fast] UUID inválido en PLAYER_READY: {}", uuidStr);
+            return;
+        }
+        proxy.getPlayer(uuid).ifPresent(player -> {
+            // 1. Enviar skin inmediatamente (cualquier servidor)
+            MojangAPI.SkinProperty skin = authProfileListener.getSkin(player.getUsername());
+            if (skin == null) skin = authProfileListener.getCrackedSkin(player.getUsername());
+            if (skin != null) {
+                String skinMsg = "SKIN:" + uuid + ":" + skin.value() + ":" + skin.signature();
+                sendMessage(source, skinMsg);
+                logger.info("[Cretania-Fast] SKIN enviada inmediatamente a {} para {}", serverName, player.getUsername());
+            } else {
+                logger.warn("[Cretania-Fast] PLAYER_READY de {} en {} sin skin en caché", player.getUsername(), serverName);
+            }
+            // 2. Enviar auth al lobby inmediatamente
+            if ("lobby".equals(serverName) && authProfileListener.hasCachedResult(player.getUsername())) {
+                boolean premium = authProfileListener.isPremium(player.getUsername());
+                String authMsg = (premium ? "PREMIUM:" : "CRACKED:") + uuid;
+                source.sendPluginMessage(CretaniaVelocityPlugin.AUTH_CHANNEL, encodeNeoForgePayload(authMsg));
+                logger.info("[Cretania-Fast] Auth ({}) enviada al lobby para {}",
+                        premium ? "PREMIUM" : "CRACKED", player.getUsername());
+            }
+        });
     }
 
     private void sendMessage(ServerConnection connection, String message) {

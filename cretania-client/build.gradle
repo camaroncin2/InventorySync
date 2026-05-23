@@ -1,0 +1,38 @@
+plugins {
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.42-beta'
+}
+
+version = project.property('mod_version')
+group = 'com.cretania.client'
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://maven.neoforged.net/releases' }
+}
+
+base {
+    archivesName = 'cretania-client'
+}
+
+neoForge {
+    version = project.property('neoforge_version')
+
+    runs {
+        client {
+            client()
+        }
+    }
+
+    mods {
+        "cretania_client" {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(project.property('java_version').toInteger())
+    }
+}
