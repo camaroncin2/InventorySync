@@ -77,7 +77,13 @@ public class InventorySync {
         }
 
         UUID uuid = player.getUUID();
+        // GUARD: si ya hay una carga en curso para este jugador, ignorar evento duplicado
+        if (SyncStateManager.isLocked(uuid)) {
+            CretaniaSync.LOGGER.warn("[Cretania] onPlayerLogIn duplicado para {} — ignorado", player.getName().getString());
+            return;
+        }
         SyncStateManager.lock(uuid);
+        player.displayClientMessage(net.minecraft.network.chat.Component.literal("§eCargando tu inventario..."), true);
         // Cargamos directamente desde MongoDB sin esperar al coordinador Velocity.
         // El logout usa .join() (bloquea) así que el save siempre termina antes
         // de que el jugador llegue al siguiente servidor — no hay race condition.
@@ -124,6 +130,13 @@ public class InventorySync {
         if (server == null) return;
         ServerPlayer player = server.getPlayerList().getPlayer(uuid);
         if (player == null) return;
+
+        // GUARD: si ya hay una carga directa en curso, ignorar LOAD_READY de Velocity
+        if (SyncStateManager.isLocked(uuid)) {
+            CretaniaSync.LOGGER.warn("[Cretania] LOAD_READY ignorado para {} — carga directa ya en curso",
+                    player.getGameProfile().getName());
+            return;
+        }
 
         String expectedScope = pendingProxyDecision.remove(uuid);
         String localScope = configuredScope();
@@ -188,6 +201,7 @@ public class InventorySync {
             clearInventoryIfConfigured(player, "empty_scope_data");
         }
 
+        player.displayClientMessage(net.minecraft.network.chat.Component.literal("§a¡Listo!"), true);
         SyncStateManager.unlock(uuid);
         SyncVisuals.removeLoadingVisuals(player);
     }

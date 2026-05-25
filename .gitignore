@@ -2,27 +2,45 @@
 .gradle/
 build/
 !gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
 
-# IDE
+# Java
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE - IntelliJ IDEA
 .idea/
 *.iml
 *.ipr
 *.iws
-.vscode/
+
+# IDE - Eclipse
 .settings/
 .classpath
 .project
 .factorypath
 
+# IDE - VS Code
+.vscode/
+
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Runtime
+# Minecraft / NeoForge runtime
 run/
 logs/
 crash-reports/
+debug/
+assets/
+libraries/
 
 # Build outputs
 out/
 bin/
+
+# Secrets / local config
+local.properties
+*.env
