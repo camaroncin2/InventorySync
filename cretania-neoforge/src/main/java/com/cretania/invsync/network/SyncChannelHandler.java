@@ -33,20 +33,16 @@ public class SyncChannelHandler {
      */
     public static final ConcurrentHashMap<UUID, double[]> PENDING_TELEPORTS = new ConcurrentHashMap<>();
 
-    public static void sendSaveComplete(ServerPlayer player, String scope) {
+    public static void sendSaveComplete(UUID uuid, String playerName, String scope, String serverName) {
         String message = MSG_SAVE_COMPLETE + MSG_SEPARATOR
-                + player.getUUID() + MSG_SEPARATOR
-                + player.getGameProfile().getName() + MSG_SEPARATOR
-                + scope;
+                + uuid + MSG_SEPARATOR
+                + playerName + MSG_SEPARATOR
+                + scope + MSG_SEPARATOR
+                + serverName;
 
-        player.connection.send(
-                new net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket(
-                        new SyncPayload(message.getBytes(StandardCharsets.UTF_8))
-                )
-        );
+        sendToVelocitySocket(message);
 
-        CretaniaSync.LOGGER.debug("[Cretania] SAVE_COMPLETE enviado para {} scope={}",
-                player.getGameProfile().getName(), scope);
+        CretaniaSync.LOGGER.debug("[Cretania] SAVE_COMPLETE enviado para {} scope={}", playerName, scope);
     }
 
     public static void handleIncomingMessage(byte[] data) {
@@ -124,27 +120,93 @@ public class SyncChannelHandler {
 
     /**
      * Notifica a Velocity que el jugador está completamente registrado en este backend.
-     * Velocity responde inmediatamente con skin + auth (sin delays fijos).
+     * Usa socket TCP directo para evitar las restricciones de dirección del canal NeoForge.
      */
     public static void sendPlayerReady(ServerPlayer player) {
         String message = "PLAYER_READY:" + player.getUUID();
-        player.connection.send(
-                new net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket(
-                        new SyncPayload(message.getBytes(StandardCharsets.UTF_8))
-                )
-        );
+        sendToVelocitySocket(message);
         CretaniaSync.LOGGER.info("[Cretania-Fast] PLAYER_READY enviado para {}",
+                player.getGameProfile().getName());
+    }
+
+    private static void sendToVelocitySocket(String message) {
+        java.util.concurrent.CompletableFuture.runAsync(() -> {
+            try (java.net.Socket sock = new java.net.Socket()) {
+                sock.connect(new java.net.InetSocketAddress("127.0.0.1", 25899), 3000);
+                sock.setSoTimeout(3000);
+                java.io.PrintWriter out = new java.io.PrintWriter(sock.getOutputStream(), true);
+                out.println(message);
+            } catch (Exception e) {
+                CretaniaSync.LOGGER.warn("[Cretania-Fast] Error enviando a Velocity socket: {}", e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Procesa la skin enviada por el cliente directamente al conectar (C2S_SKIN).
+     * 1. Aplica la skin en este servidor inmediatamente (sin esperar Velocity).
+     * 2. Reenvía a Velocity como UPLOAD_SKIN para que la cachee para futuros servidores.
+     * Formato del mensaje: C2S_SKIN:<value>:<signature>
+     */
+    public static void handleClientSkinMessage(byte[] data, ServerPlayer player) {
+        String message = new String(data, StandardCharsets.UTF_8);
+        // C2S_SKIN:<value>:<signature>  — base64 no contiene ':'
+        String[] parts = message.split(":", 3);
+        if (parts.length < 2 || parts[1].isBlank()) {
+            CretaniaSync.LOGGER.warn("[Cretania-Fast] C2S_SKIN malformado de {}",
+                    player.getGameProfile().getName());
+            return;
+        }
+        String value = parts[1];
+        String sig   = parts.length >= 3 ? parts[2] : "";
+
+        UUID uuid = player.getUUID();
+
+        // 1. Aplicar skin en este servidor inmediatamente
+        CretaniaSync.getInstance().getInventorySync().applyPlayerSkin(uuid, value,
+                sig.isBlank() ? null : sig);
+
+        // 2. Reenviar a Velocity como UPLOAD_SKIN para cachear en AuthProfileListener
+        String forward = "UPLOAD_SKIN:" + uuid + ":" + value + ":" + sig;
+        sendToVelocitySocket(forward);
+        CretaniaSync.LOGGER.info("[Cretania-Fast] C2S_SKIN de {} → skin aplicada + UPLOAD_SKIN a Velocity",
                 player.getGameProfile().getName());
     }
 
     /**
      * Teletransporta al jugador a la posición preservada desde el servidor origen.
      * Usar en el hilo principal del servidor (game thread).
+     *
+     * Si Y >= 256, se interpreta como "sky" (RTP) → ajusta Y al top non-air block + 1.
+     * Si Y resultante cae en void o en bloque no caminable, también ajusta para evitar
+     * que el jugador muera al spawnear.
      */
     public static void applyTeleport(ServerPlayer player, double x, double y, double z, float yaw, float pitch) {
+        // Sky marker: si Y >= 256 venimos de un RTP — buscar superficie segura.
+        if (y >= 256) {
+            int safeY = findSafeY(player.serverLevel(), (int) Math.floor(x), (int) Math.floor(z));
+            y = safeY + 0.1; // +0.1 para que no quede dentro del bloque
+            CretaniaSync.LOGGER.info("[Cretania-Zone] RTP: Y ajustado a {} (top block + 1) para ({},{})",
+                    safeY, (int) x, (int) z);
+        }
         player.connection.teleport(x, y, z, yaw, pitch);
         CretaniaSync.LOGGER.info("[Cretania-Zone] {} teletransportado a ({},{},{}) en {}",
                 player.getGameProfile().getName(), x, y, z,
                 player.serverLevel().dimension().location());
+    }
+
+    /**
+     * Busca el primer bloque no-aire desde arriba (Y=320) y devuelve Y+1 (sobre el bloque).
+     * Usa Heightmap del chunk si está cargado, sino carga el chunk forzosamente.
+     */
+    private static int findSafeY(net.minecraft.server.level.ServerLevel level, int x, int z) {
+        // Forzar carga del chunk en (x>>4, z>>4) para que la heightmap esté disponible
+        level.getChunkSource().getChunk(x >> 4, z >> 4, true);
+        int topY = level.getHeight(
+                net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                x, z);
+        // Si el chunk está en void / vacío, fallback a Y=100
+        if (topY <= level.getMinBuildHeight()) return 100;
+        return topY;
     }
 }

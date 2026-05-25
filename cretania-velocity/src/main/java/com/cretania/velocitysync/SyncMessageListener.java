@@ -22,14 +22,11 @@ public class SyncMessageListener {
     private final ProxyServer proxy;
     private final Logger logger;
     private final InventoryGroupConfig groupConfig;
-    private final AuthProfileListener authProfileListener;
 
-    public SyncMessageListener(ProxyServer proxy, Logger logger, InventoryGroupConfig groupConfig,
-                               AuthProfileListener authProfileListener) {
+    public SyncMessageListener(ProxyServer proxy, Logger logger, InventoryGroupConfig groupConfig) {
         this.proxy = proxy;
         this.logger = logger;
         this.groupConfig = groupConfig;
-        this.authProfileListener = authProfileListener;
     }
 
     @Subscribe
@@ -43,8 +40,8 @@ public class SyncMessageListener {
             String message = decodeMessage(event.getData());
             handleMessage(message, source);
         } else if (event.getIdentifier().equals(CretaniaVelocityPlugin.AUTH_CHANNEL)) {
-            // Canal authmod:check: el lobby notifica skins cracked (CRACKED_SKIN)
-            event.setResult(PluginMessageEvent.ForwardResult.handled());
+            // authmod:check: se deja pasar al cliente (forward por defecto).
+            // Velocity solo procesa CRACKED_SKIN y TRANSFER internamente.
             String message = decodeMessage(event.getData());
             handleAuthChannelMessage(message);
         }
@@ -61,39 +58,25 @@ public class SyncMessageListener {
             handleSaveComplete(parts[1], parts.length > 2 ? parts[2] : "unknown", parts.length > 3 ? parts[3] : "", source);
         } else if ("PLAYER_READY".equals(parts[0])) {
             handlePlayerReady(parts[1], source.getServerInfo().getName(), source);
+        } else if ("UPLOAD_SKIN".equals(parts[0])) {
+            // Velocity ya no cachea skins — se ignora, se mantiene como no-op para compat.
+            logger.debug("[Cretania] UPLOAD_SKIN recibido pero ignorado (Velocity ya no gestiona skins).");
         } else {
             logger.warn("[Cretania] Tipo de mensaje desconocido: {}", parts[0]);
         }
     }
 
     /**
-     * Maneja mensajes del canal authmod:check provenientes del backend (lobby).
-     * Protocolos soportados:
-     *   CRACKED_SKIN:<uuid>:<value>:<signature>
-     *   TRANSFER:<uuid>:<serverName>
+     * Mensajes del canal authmod:check provenientes del backend.
+     * Velocity solo procesa TRANSFER (necesario para zonas). CHALLENGE, CRACKED_SKIN
+     * y demás pasan transparentes al cliente; cretaniasync/authmod los gestionan
+     * en backend o cliente. Logueamos en debug para no spammear el log.
      */
     private void handleAuthChannelMessage(String message) {
-        if (message.startsWith("CRACKED_SKIN:")) {
-            // value/sig pueden contener ':' internamente → split límite 4
-            String[] parts = message.split(":", 4);
-            if (parts.length == 4) {
-                String uuidStr   = parts[1];
-                String value     = parts[2];
-                String signature = parts[3];
-                try {
-                    UUID uuid = UUID.fromString(uuidStr);
-                    proxy.getPlayer(uuid).ifPresent(player -> {
-                        authProfileListener.setCrackedSkin(
-                                player.getUsername(),
-                                new MojangAPI.SkinProperty(value, signature)
-                        );
-                        logger.info("[Cretania-Skin] CRACKED_SKIN recibida y cacheada para {}", player.getUsername());
-                    });
-                } catch (IllegalArgumentException e) {
-                    logger.warn("[Cretania-Skin] UUID invalido en CRACKED_SKIN: {}", uuidStr);
-                }
-            }
-        } else if (message.startsWith("TRANSFER:")) {
+        if (message.startsWith("CHALLENGE:") || message.startsWith("CRACKED_SKIN:")) {
+            return; // pasan transparente al cliente, no nos interesa procesar
+        }
+        if (message.startsWith("TRANSFER:")) {
             // TRANSFER:<uuid>:<serverName>[:<x>:<y>:<z>:<yaw>:<pitch>]
             String[] parts = message.split(":", 8);
             if (parts.length >= 3) {
@@ -132,7 +115,8 @@ public class SyncMessageListener {
                 }
             }
         } else {
-            logger.warn("[Cretania] Mensaje authmod:check desconocido desde backend: {}", message);
+            logger.debug("[Cretania] authmod:check no procesado por Velocity (pasa al cliente): {}",
+                    message.length() > 80 ? message.substring(0, 80) + "..." : message);
         }
     }
 
@@ -194,37 +178,108 @@ public class SyncMessageListener {
     }
 
     /**
-     * Responde inmediatamente al PLAYER_READY del backend enviando skin + auth sin delays.
-     * El backend dispara PLAYER_READY en PlayerLoggedInEvent — jugador ya registrado.
+     * Punto de entrada desde TCP socket (TransferSocketServer) para PLAYER_READY.
+     * Busca la conexión actual del jugador en el proxy y delega a handlePlayerReady.
      */
-    private void handlePlayerReady(String uuidStr, String serverName, ServerConnection source) {
+    void handlePlayerReadyFromSocket(String uuidStr) {
         UUID uuid;
         try {
             uuid = UUID.fromString(uuidStr);
         } catch (IllegalArgumentException e) {
+            logger.warn("[Cretania-Fast] UUID inválido en PLAYER_READY (socket): {}", uuidStr);
+            return;
+        }
+        proxy.getPlayer(uuid).ifPresentOrElse(
+                player -> player.getCurrentServer().ifPresentOrElse(
+                        source -> handlePlayerReady(uuidStr, source.getServerInfo().getName(), source),
+                        () -> logger.warn("[Cretania-Fast] PLAYER_READY socket: {} sin servidor actual", uuidStr)
+                ),
+                () -> logger.warn("[Cretania-Fast] PLAYER_READY socket: jugador {} no encontrado en proxy", uuidStr)
+        );
+    }
+
+    /**
+     * @deprecated Velocity ya no cachea skins. No-op para compat con TransferSocketServer.
+     * El backend ahora hace el broadcast directamente al cliente vía cretaniasync.
+     */
+    @Deprecated
+    void handleUploadSkinFromSocket(String uuidStr, String value, String sig) {
+        logger.debug("[Cretania] UPLOAD_SKIN socket ignorado (Velocity no gestiona skins).");
+    }
+
+    /**
+     * Punto de entrada desde TCP socket para SAVE_COMPLETE.
+     * El nombre del servidor origen viene incluido en el mensaje de socket.
+     */
+    void handleSaveCompleteFromSocket(String uuidStr, String playerName, String savedScope, String sourceServerName) {
+        UUID uuid;
+        try {
+            uuid = UUID.fromString(uuidStr);
+        } catch (IllegalArgumentException e) {
+            logger.warn("[Cretania] UUID inválido en SAVE_COMPLETE (socket): {}", uuidStr);
+            return;
+        }
+
+        String expectedOrigin = PlayerSyncState.getOriginServer(uuid);
+        if (expectedOrigin != null && !expectedOrigin.equals(sourceServerName)) {
+            logger.warn("[Cretania] SAVE_COMPLETE socket de {} ignorado: origen esperado {}, recibido {}.",
+                    playerName, expectedOrigin, sourceServerName);
+            return;
+        }
+
+        PlayerSyncState.markReady(uuid);
+        logger.info("[Cretania] Guardado completado (socket) para {} ({}) scope='{}'.", playerName, uuid, savedScope);
+
+        Optional<Player> optionalPlayer = proxy.getPlayer(uuid);
+        if (optionalPlayer.isEmpty()) {
+            PlayerSyncState.clear(uuid);
+            return;
+        }
+
+        Player player = optionalPlayer.get();
+        Optional<ServerConnection> currentServer = player.getCurrentServer();
+        if (currentServer.isEmpty()) {
+            PlayerSyncState.clear(uuid);
+            return;
+        }
+
+        String currentServerName = currentServer.get().getServerInfo().getName();
+        String expectedTarget = PlayerSyncState.getTargetServer(uuid);
+        String expectedGroup = PlayerSyncState.getTargetGroup(uuid);
+        String currentGroup = groupConfig.groupForServer(currentServerName);
+
+        if (expectedTarget != null && !expectedTarget.equals(currentServerName)) {
+            logger.warn("[Cretania] SAVE_COMPLETE socket de {} ignorado: destino esperado {}, actual {}.",
+                    playerName, expectedTarget, currentServerName);
+            PlayerSyncState.clear(uuid);
+            return;
+        }
+
+        if (!currentGroup.isBlank() && currentGroup.equals(savedScope) && currentGroup.equals(expectedGroup)) {
+            sendMessage(currentServer.get(), MSG_LOAD_READY + MSG_SEPARATOR + uuid + MSG_SEPARATOR + currentGroup);
+            logger.info("[Cretania] LOAD_READY (socket) enviado a {} para scope '{}'.", playerName, currentGroup);
+        } else {
+            sendMessage(currentServer.get(), MSG_LOAD_SKIP + MSG_SEPARATOR + uuid + MSG_SEPARATOR + "scope_mismatch");
+            logger.info("[Cretania] LOAD_SKIP (socket) enviado a {}. currentGroup='{}', savedScope='{}', expectedGroup='{}'.",
+                    playerName, currentGroup, savedScope, expectedGroup);
+        }
+
+        PlayerSyncState.clear(uuid);
+    }
+
+    /**
+     * PLAYER_READY desde el backend: cretaniasync notifica que el jugador ya está
+     * cargado en el mundo. Velocity ya no envía skin en respuesta — el cliente
+     * envía su skin via C2S_SKIN al backend, y cretaniasync hace el broadcast.
+     */
+    private void handlePlayerReady(String uuidStr, String serverName, ServerConnection source) {
+        try {
+            UUID.fromString(uuidStr);
+        } catch (IllegalArgumentException e) {
             logger.warn("[Cretania-Fast] UUID inválido en PLAYER_READY: {}", uuidStr);
             return;
         }
-        proxy.getPlayer(uuid).ifPresent(player -> {
-            // 1. Enviar skin inmediatamente (cualquier servidor)
-            MojangAPI.SkinProperty skin = authProfileListener.getSkin(player.getUsername());
-            if (skin == null) skin = authProfileListener.getCrackedSkin(player.getUsername());
-            if (skin != null) {
-                String skinMsg = "SKIN:" + uuid + ":" + skin.value() + ":" + skin.signature();
-                sendMessage(source, skinMsg);
-                logger.info("[Cretania-Fast] SKIN enviada inmediatamente a {} para {}", serverName, player.getUsername());
-            } else {
-                logger.warn("[Cretania-Fast] PLAYER_READY de {} en {} sin skin en caché", player.getUsername(), serverName);
-            }
-            // 2. Enviar auth al lobby inmediatamente
-            if ("lobby".equals(serverName) && authProfileListener.hasCachedResult(player.getUsername())) {
-                boolean premium = authProfileListener.isPremium(player.getUsername());
-                String authMsg = (premium ? "PREMIUM:" : "CRACKED:") + uuid;
-                source.sendPluginMessage(CretaniaVelocityPlugin.AUTH_CHANNEL, encodeNeoForgePayload(authMsg));
-                logger.info("[Cretania-Fast] Auth ({}) enviada al lobby para {}",
-                        premium ? "PREMIUM" : "CRACKED", player.getUsername());
-            }
-        });
+        logger.debug("[Cretania-Fast] PLAYER_READY recibido de {} para {}", serverName, uuidStr);
     }
 
     private void sendMessage(ServerConnection connection, String message) {

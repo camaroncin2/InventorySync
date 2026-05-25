@@ -11,6 +11,9 @@ import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
 import org.slf4j.Logger;
 
 import java.nio.file.Path;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Plugin principal de Velocity para Cretania.
@@ -32,11 +35,20 @@ public class CretaniaVelocityPlugin {
     public static final MinecraftChannelIdentifier AUTH_CHANNEL =
             MinecraftChannelIdentifier.from("authmod:check");
 
+    /** @deprecated Velocity ya no envía skins. Mantenido para no romper imports externos. */
+    @Deprecated
+    public static final Set<UUID> SKIN_SENT_VIA_READY = ConcurrentHashMap.newKeySet();
+
+    /** @deprecated Velocity ya no envía auth. Mantenido para no romper imports externos. */
+    @Deprecated
+    public static final Set<UUID> AUTH_SENT_VIA_READY = ConcurrentHashMap.newKeySet();
+
     private final ProxyServer server;
     private final Logger logger;
     private final Path dataDirectory;
     private static CretaniaVelocityPlugin instance;
     private TransferSocketServer transferSocketServer;
+    private WhitelistManager whitelistManager;
 
     @Inject
     public CretaniaVelocityPlugin(ProxyServer server, Logger logger, @DataDirectory Path dataDirectory) {
@@ -56,19 +68,31 @@ public class CretaniaVelocityPlugin {
         InventoryGroupConfig groupConfig = new InventoryGroupConfig(dataDirectory, logger);
         groupConfig.load();
 
-        // AuthProfileListener: inyecta skin premium durante el login (GameProfileRequestEvent)
-        AuthProfileListener authProfileListener = new AuthProfileListener(logger);
+        // Velocity ya NO inyecta skin ni verifica premium — esa lógica vive en los mods
+        // backend (authmod en lobby para auth, cretaniasync en cada backend para skin).
+        // Velocity solo hace plugin-message bridge + TCP TRANSFER socket (zonas) + LOAD/SKIP
+        // de inventario por scope. AuthProfileListener/MojangAPI quedan como dead code.
+        SyncMessageListener syncMessageListener = new SyncMessageListener(server, logger, groupConfig);
+        server.getEventManager().register(this, syncMessageListener);
+        server.getEventManager().register(this, new PlayerConnectionListener(server, logger, groupConfig));
 
-        // Registrar listeners
-        server.getEventManager().register(this, authProfileListener);
-        server.getEventManager().register(this, new SyncMessageListener(server, logger, groupConfig, authProfileListener));
-        server.getEventManager().register(this, new PlayerConnectionListener(server, logger, groupConfig, authProfileListener));
-
-        // Servidor TCP local para recibir TRANSFER directo desde los backends (sin pasar por el cliente)
-        transferSocketServer = new TransferSocketServer(server, logger);
+        // Servidor TCP local para TRANSFER (zonas) + PLAYER_READY + SAVE_COMPLETE
+        transferSocketServer = new TransferSocketServer(server, logger, syncMessageListener);
         transferSocketServer.start();
 
-        logger.info("[Cretania] Plugin de Velocity inicializado correctamente.");
+        // Whitelist por NOMBRE (case-insensitive) — pensada para cracked/mixto.
+        // Bloquea en PreLoginEvent → kick antes de tocar backends. Comandos: /cwhitelist /cwl
+        whitelistManager = new WhitelistManager(dataDirectory, logger);
+        whitelistManager.load();
+        server.getEventManager().register(this, new WhitelistLoginListener(whitelistManager, logger));
+        var cmdManager = server.getCommandManager();
+        var meta = cmdManager.metaBuilder("cwhitelist")
+                .aliases("cwl")
+                .plugin(this)
+                .build();
+        cmdManager.register(meta, new WhitelistCommand(whitelistManager));
+
+        logger.info("[Cretania] Plugin de Velocity inicializado (modo bridge — sin auth/skin).");
     }
 
     @Subscribe

@@ -59,6 +59,8 @@ public class CretaniaSync {
         NeoForge.EVENT_BUS.register(syncStateManager);
         // Zona de retorno: detecta cuando un jugador sale de la zona de este servidor
         NeoForge.EVENT_BUS.addListener(ReturnZoneManager::onServerTick);
+        // Anti-bucle: al login, si cayó dentro de zona trigger → TP a spawn safe
+        NeoForge.EVENT_BUS.addListener(ReturnZoneManager::onPlayerLogin);
 
         // Registrar payload de red en el mod event bus
         modEventBus.addListener(this::onRegisterPayloads);
@@ -74,7 +76,20 @@ public class CretaniaSync {
         registrar.playToServer(
                 SyncPayload.TYPE,
                 SyncPayload.STREAM_CODEC,
-                (payload, context) -> SyncChannelHandler.handleIncomingMessage(payload.data())
+                (payload, context) -> {
+                    String msg = new String(payload.data(), java.nio.charset.StandardCharsets.UTF_8);
+                    if (msg.startsWith("C2S_SKIN:")) {
+                        // Skin enviada por el cliente directamente — aplicar sin esperar Velocity
+                        context.enqueueWork(() ->
+                                SyncChannelHandler.handleClientSkinMessage(
+                                        payload.data(),
+                                        (net.minecraft.server.level.ServerPlayer) context.player()
+                                )
+                        );
+                    } else {
+                        SyncChannelHandler.handleIncomingMessage(payload.data());
+                    }
+                }
         );
         // S2C: solo en servidor dedicado para evitar conflicto con cretania-client en singleplayer
         if (FMLEnvironment.dist == Dist.DEDICATED_SERVER) {
