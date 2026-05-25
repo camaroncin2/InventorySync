@@ -35,6 +35,7 @@ public class TransferSocketServer {
 
     private final ProxyServer proxy;
     private final Logger logger;
+    private final SyncMessageListener syncListener;
 
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "cretania-transfer-socket");
@@ -45,9 +46,10 @@ public class TransferSocketServer {
     private volatile boolean running = false;
     private ServerSocket serverSocket;
 
-    public TransferSocketServer(ProxyServer proxy, Logger logger) {
+    public TransferSocketServer(ProxyServer proxy, Logger logger, SyncMessageListener syncListener) {
         this.proxy = proxy;
         this.logger = logger;
+        this.syncListener = syncListener;
     }
 
     // -------------------------------------------------------------------------
@@ -114,6 +116,39 @@ public class TransferSocketServer {
                     }
                 } else {
                     logger.warn("[Cretania-Socket] Mensaje TRANSFER malformado: {}", line);
+                }
+            } else if (line.startsWith("PLAYER_READY:")) {
+                // PLAYER_READY:<uuid>
+                String[] parts = line.split(":", 2);
+                if (parts.length == 2) {
+                    syncListener.handlePlayerReadyFromSocket(parts[1].trim());
+                } else {
+                    logger.warn("[Cretania-Socket] Mensaje PLAYER_READY malformado: {}", line);
+                }
+            } else if (line.startsWith("UPLOAD_SKIN:")) {
+                // UPLOAD_SKIN:<uuid>:<value>:<sig>  — base64 no contiene ':'
+                String[] parts = line.split(":", 4);
+                if (parts.length >= 3) {
+                    syncListener.handleUploadSkinFromSocket(
+                            parts[1].trim(),
+                            parts[2].trim(),
+                            parts.length == 4 ? parts[3].trim() : ""
+                    );
+                } else {
+                    logger.warn("[Cretania-Socket] Mensaje UPLOAD_SKIN malformado: {}", line);
+                }
+            } else if (line.startsWith("SAVE_COMPLETE:")) {
+                // SAVE_COMPLETE:<uuid>:<playerName>:<scope>:<serverName>
+                String[] parts = line.split(":", 5);
+                if (parts.length == 5) {
+                    syncListener.handleSaveCompleteFromSocket(
+                            parts[1].trim(),
+                            parts[2].trim(),
+                            parts[3].trim(),
+                            parts[4].trim()
+                    );
+                } else {
+                    logger.warn("[Cretania-Socket] Mensaje SAVE_COMPLETE malformado: {}", line);
                 }
             } else {
                 logger.warn("[Cretania-Socket] Mensaje desconocido: {}", line);
