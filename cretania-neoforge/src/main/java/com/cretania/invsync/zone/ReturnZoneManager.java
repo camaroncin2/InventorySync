@@ -167,59 +167,23 @@ public class ReturnZoneManager {
     // -------------------------------------------------------------------------
 
     /**
-     * Anti-bucle al entrar al server: si el jugador apareció dentro de alguna
-     * trigger_zone (porque su última posición guardada estaba ahí), TP al spawn
-     * del overworld para que NO se dispare un TRANSFER inmediato.
+     * Anti-bucle al entrar al server: TRANSFERRING flag durante 10 s evita que
+     * el tick check dispare TRANSFER inmediato si el player aparece dentro de
+     * alguna zona trigger. NO se TPea al jugador — respeta su posición.
+     *
+     * El forced_spawn de cretaniasync (si está configurado) ya garantiza que el
+     * player aparezca en un lugar safe fuera de zonas. Antes este handler TPeaba
+     * a spawn overworld lo cual sobreescribía el forced_spawn — bug reportado.
      */
     public static void onPlayerLogin(net.neoforged.neoforge.event.entity.player.PlayerEvent.PlayerLoggedInEvent event) {
         if (triggerZones.isEmpty() && !enabled) return;
         if (!(event.getEntity() instanceof ServerPlayer player)) return;
 
         UUID uuid = player.getUUID();
-        MinecraftServer srv = player.getServer();
-
-        // Período de gracia: el tick check no debe disparar TRANSFER mientras carga
         TRANSFERRING.add(uuid);
 
         java.util.concurrent.CompletableFuture.runAsync(() -> {
-            // Esperar a que SET_POSITION / load de inventario / chunks se apliquen
-            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
-
-            srv.execute(() -> {
-                if (srv.getPlayerList().getPlayer(uuid) == null) return;
-                double px = player.getX();
-                double py = player.getY();
-                double pz = player.getZ();
-
-                boolean inTrigger = false;
-                for (TriggerZone tz : triggerZones) {
-                    if (tz.contains(px, py, pz)) {
-                        inTrigger = true;
-                        break;
-                    }
-                }
-                boolean outsideMain = enabled && (px < minX || px > maxX || pz < minZ || pz > maxZ);
-
-                if (inTrigger || outsideMain) {
-                    // Cayó en zona trigger o fuera de zona principal → TP al spawn safe
-                    net.minecraft.server.level.ServerLevel overworld = srv.overworld();
-                    if (overworld == null) return;
-                    net.minecraft.core.BlockPos spawn = overworld.getSharedSpawnPos();
-                    try {
-                        player.teleportTo(overworld,
-                                spawn.getX() + 0.5, spawn.getY() + 1.0, spawn.getZ() + 0.5,
-                                java.util.Set.of(), 0f, 0f);
-                    } catch (Throwable t) {
-                        player.teleportTo(spawn.getX() + 0.5, spawn.getY() + 1.0, spawn.getZ() + 0.5);
-                    }
-                    CretaniaSync.LOGGER.info("[Cretania-Zones] {} apareció en zona ({},{},{}) → TP a spawn overworld ({},{},{}) para evitar bucle",
-                            player.getGameProfile().getName(), px, py, pz,
-                            spawn.getX(), spawn.getY(), spawn.getZ());
-                }
-            });
-
-            // Completar 10 s de gracia
-            try { Thread.sleep(9_500); } catch (InterruptedException ignored) {}
+            try { Thread.sleep(10_000); } catch (InterruptedException ignored) {}
             TRANSFERRING.remove(uuid);
         });
     }
