@@ -6,6 +6,7 @@ import com.cretania.invsync.logic.SyncStateManager;
 import com.cretania.invsync.network.SkinClientPayload;
 import com.cretania.invsync.network.SyncChannelHandler;
 import com.cretania.invsync.network.SyncPayload;
+import com.cretania.invsync.zone.PortalManager;
 import com.cretania.invsync.zone.ReturnZoneManager;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
@@ -61,6 +62,10 @@ public class CretaniaSync {
         NeoForge.EVENT_BUS.addListener(ReturnZoneManager::onServerTick);
         // Anti-bucle: al login, si cayó dentro de zona trigger → TP a spawn safe
         NeoForge.EVENT_BUS.addListener(ReturnZoneManager::onPlayerLogin);
+        // Portales físicos (bloques nether_portal) → transferencia entre servers
+        NeoForge.EVENT_BUS.addListener(PortalManager::onServerTick);
+        NeoForge.EVENT_BUS.addListener(PortalManager::onDimensionTravel);
+        NeoForge.EVENT_BUS.addListener(PortalManager::onRegisterCommands);
 
         // Registrar payload de red en el mod event bus
         modEventBus.addListener(this::onRegisterPayloads);
@@ -127,6 +132,8 @@ public class CretaniaSync {
 
         // Inicializar la zona de retorno (si hay config)
         ReturnZoneManager.init(event.getServer());
+        // Inicializar portales físicos (config/invsync-portals.toml)
+        PortalManager.init(event.getServer());
     }
 
     /**
