@@ -5,7 +5,6 @@ import com.electronwill.nightconfig.core.Config;
 import com.electronwill.nightconfig.core.file.FileConfig;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.FloatArgumentType;
-import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.minecraft.ChatFormatting;
 import net.minecraft.commands.CommandSourceStack;
@@ -46,6 +45,11 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * (/portales) o por comandos — los cambios aplican al instante y se
  * persisten en config/invsync-portals.toml.
  *
+ * El teletransporte es siempre instantáneo y literal: si el portal tiene
+ * coords destino configuradas se usa esa posición exacta; si no, se usa el
+ * propio bloque del portal (centro X/Z, Y del piso). No hay RTP ni búsqueda
+ * de terreno — así se evita aterrizar lejos del área esperada.
+ *
  * Ejemplo de config generada:
  * servers = ["lobby", "survival"]
  *
@@ -55,14 +59,13 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * x1 = 100  y1 = 64  z1 = 200
  * x2 = 100  y2 = 66  z2 = 202
  * targetServer = "survival"
- * # opcionales: target_x/y/z/yaw/pitch, rtp_radius
+ * # opcionales: target_x/y/z/yaw/pitch
  */
 public class PortalManager {
 
-    private static final int CHECK_INTERVAL    = 5;   // 0.25 s — igual que zonas local_rtp
+    private static final int CHECK_INTERVAL    = 5;   // 0.25 s — throttle de la transferencia
     private static final int MAX_PORTAL_BLOCKS = 512; // tope del flood-fill
     private static final int SEARCH_RADIUS     = 4;   // radio de búsqueda del portal al crear
-    private static final int DEFAULT_RTP_RADIUS = 1000;
 
     private static int tickCounter = 0;
     private static Path configPath;
@@ -72,28 +75,46 @@ public class PortalManager {
                             int maxX, int maxY, int maxZ,
                             String targetServer,
                             Double targetX, Double targetY, Double targetZ,
-                            Float targetYaw, Float targetPitch,
-                            Integer rtpRadius) {
+                            Float targetYaw, Float targetPitch) {
+
+        /**
+         * Margen de tolerancia (bloques) alrededor de la caja exacta del portal.
+         * Sin esto, un jugador parado justo en el borde (p. ej. Y mínimo) puede
+         * fluctuar sub-bloque por física y caer fuera de la caja la mayoría de
+         * los ticks — con la caja "a ras" eso deja tanto la detección del portal
+         * como la protección anti-Nether sin activarse casi nunca.
+         */
+        private static final int HITBOX_PADDING = 1;
 
         public boolean contains(String dim, BlockPos pos) {
             return dimension.equals(dim)
-                    && pos.getX() >= minX && pos.getX() <= maxX
-                    && pos.getY() >= minY && pos.getY() <= maxY
-                    && pos.getZ() >= minZ && pos.getZ() <= maxZ;
+                    && pos.getX() >= minX - HITBOX_PADDING && pos.getX() <= maxX + HITBOX_PADDING
+                    && pos.getY() >= minY - HITBOX_PADDING && pos.getY() <= maxY + HITBOX_PADDING
+                    && pos.getZ() >= minZ - HITBOX_PADDING && pos.getZ() <= maxZ + HITBOX_PADDING;
         }
 
         public boolean hasTargetCoords() {
             return targetX != null && targetY != null && targetZ != null;
         }
 
-        public boolean isRtp() {
-            return rtpRadius != null && rtpRadius > 0;
+        /** Centro del bloque de portal en X, para aterrizar literalmente en el portal. */
+        public double landingX() {
+            return (minX + maxX) / 2.0 + 0.5;
+        }
+
+        /** Y del bloque inferior del portal (nivel de piso al pisarlo). */
+        public double landingY() {
+            return minY;
+        }
+
+        /** Centro del bloque de portal en Z, para aterrizar literalmente en el portal. */
+        public double landingZ() {
+            return (minZ + maxZ) / 2.0 + 0.5;
         }
 
         public String modeDescription() {
-            if (isRtp()) return "RTP (radio " + rtpRadius + ")";
             if (hasTargetCoords()) return String.format(Locale.US, "Coords (%.1f, %.1f, %.1f)", targetX, targetY, targetZ);
-            return "Spawn del servidor";
+            return "Portal de origen (mismo punto, instantáneo)";
         }
     }
 
@@ -147,12 +168,11 @@ public class PortalManager {
                 Double tz = pc.contains("target_z") ? ((Number) pc.get("target_z")).doubleValue() : null;
                 Float tyaw = pc.contains("target_yaw") ? ((Number) pc.get("target_yaw")).floatValue() : null;
                 Float tpitch = pc.contains("target_pitch") ? ((Number) pc.get("target_pitch")).floatValue() : null;
-                Integer rtp = pc.contains("rtp_radius") ? ((Number) pc.get("rtp_radius")).intValue() : null;
 
                 PortalDef def = new PortalDef(name, dimension,
                         Math.min(x1, x2), Math.min(y1, y2), Math.min(z1, z2),
                         Math.max(x1, x2), Math.max(y1, y2), Math.max(z1, z2),
-                        target, tx, ty, tz, tyaw, tpitch, rtp);
+                        target, tx, ty, tz, tyaw, tpitch);
                 PORTALS.put(key(name), def);
                 CretaniaSync.LOGGER.info("[Cretania-Portales] PORTAL '{}' {} X[{},{}] Y[{},{}] Z[{},{}] → {} ({})",
                         name, dimension, def.minX(), def.maxX(), def.minY(), def.maxY(),
@@ -187,7 +207,6 @@ public class PortalManager {
                     if (p.targetZ() != null) c.set("target_z", p.targetZ());
                     if (p.targetYaw() != null) c.set("target_yaw", p.targetYaw().doubleValue());
                     if (p.targetPitch() != null) c.set("target_pitch", p.targetPitch().doubleValue());
-                    if (p.rtpRadius() != null) c.set("rtp_radius", p.rtpRadius());
                     list.add(c);
                 }
                 config.set("portal", list);
@@ -291,7 +310,7 @@ public class PortalManager {
         String defaultServer = SERVERS.isEmpty() ? "lobby" : SERVERS.get(0);
         PortalDef def = new PortalDef(name, level.dimension().location().toString(),
                 minX, minY, minZ, maxX, maxY, maxZ,
-                defaultServer, null, null, null, null, null, null);
+                defaultServer, null, null, null, null, null);
         PORTALS.put(key(name), def);
         save();
         CretaniaSync.LOGGER.info("[Cretania-Portales] Portal '{}' creado por {} ({} bloques) → {}",
@@ -319,7 +338,7 @@ public class PortalManager {
         String s = server.toLowerCase(Locale.ROOT);
         PortalDef updated = new PortalDef(p.name(), p.dimension(),
                 p.minX(), p.minY(), p.minZ(), p.maxX(), p.maxY(), p.maxZ(),
-                s, p.targetX(), p.targetY(), p.targetZ(), p.targetYaw(), p.targetPitch(), p.rtpRadius());
+                s, p.targetX(), p.targetY(), p.targetZ(), p.targetYaw(), p.targetPitch());
         PORTALS.put(key(name), updated);
         if (!SERVERS.contains(s)) SERVERS.add(s);
         save();
@@ -332,38 +351,10 @@ public class PortalManager {
         if (p == null) return null;
         PortalDef updated = new PortalDef(p.name(), p.dimension(),
                 p.minX(), p.minY(), p.minZ(), p.maxX(), p.maxY(), p.maxZ(),
-                p.targetServer(), x, y, z, yaw, pitch, x == null ? p.rtpRadius() : null);
+                p.targetServer(), x, y, z, yaw, pitch);
         PORTALS.put(key(name), updated);
         save();
         return updated;
-    }
-
-    /** radius <= 0 desactiva el RTP. */
-    public static PortalDef setRtpRadius(String name, int radius) {
-        PortalDef p = get(name);
-        if (p == null) return null;
-        PortalDef updated = new PortalDef(p.name(), p.dimension(),
-                p.minX(), p.minY(), p.minZ(), p.maxX(), p.maxY(), p.maxZ(),
-                p.targetServer(), p.targetX(), p.targetY(), p.targetZ(), p.targetYaw(), p.targetPitch(),
-                radius <= 0 ? null : radius);
-        PORTALS.put(key(name), updated);
-        save();
-        return updated;
-    }
-
-    /** Presets de radio RTP que cicla el botón del menú (0 = desactivado). */
-    private static final int[] RTP_PRESETS = {0, 250, 500, 1000, 2500, 5000, 10000};
-
-    /** Cicla al siguiente preset de RTP: off → 250 → 500 → ... → 10000 → off. */
-    public static PortalDef cycleRtpPreset(String name) {
-        PortalDef p = get(name);
-        if (p == null) return null;
-        int current = p.isRtp() ? p.rtpRadius() : 0;
-        int next = 0; // si no hay preset mayor, vuelve a off
-        for (int r : RTP_PRESETS) {
-            if (r > current) { next = r; break; }
-        }
-        return setRtpRadius(name, next);
     }
 
     /** Renombra un portal. Falla (null) si no existe o el nombre nuevo ya está en uso. */
@@ -374,7 +365,7 @@ public class PortalManager {
         PortalDef updated = new PortalDef(newName, p.dimension(),
                 p.minX(), p.minY(), p.minZ(), p.maxX(), p.maxY(), p.maxZ(),
                 p.targetServer(), p.targetX(), p.targetY(), p.targetZ(),
-                p.targetYaw(), p.targetPitch(), p.rtpRadius());
+                p.targetYaw(), p.targetPitch());
         PORTALS.put(key(newName), updated);
         save();
         CretaniaSync.LOGGER.info("[Cretania-Portales] Portal '{}' renombrado a '{}'", oldName, newName);
@@ -387,10 +378,31 @@ public class PortalManager {
 
     public static void onServerTick(ServerTickEvent.Post event) {
         if (PORTALS.isEmpty()) return;
+
+        MinecraftServer server = event.getServer();
+
+        // Cada tick (sin throttle): mientras el jugador esté parado sobre bloques
+        // de un portal registrado, se le congela el contador de portal vanilla.
+        // Esto evita la carrera que a veces lo teletransportaba al Nether: sin
+        // esto, Entity#handlePortal() puede completar su cuenta e iniciar el
+        // cambio de dimensión vanilla ANTES de que la transferencia custom
+        // (que corre cada CHECK_INTERVAL ticks + delay async) llegue a moverlo.
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            BlockPos feet = player.blockPosition();
+            if (!player.level().getBlockState(feet).is(Blocks.NETHER_PORTAL)) continue;
+
+            String dim = player.level().dimension().location().toString();
+            for (PortalDef p : PORTALS.values()) {
+                if (p.contains(dim, feet)) {
+                    player.setPortalCooldown();
+                    break;
+                }
+            }
+        }
+
         if (++tickCounter < CHECK_INTERVAL) return;
         tickCounter = 0;
 
-        MinecraftServer server = event.getServer();
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
             if (ReturnZoneManager.isTransferring(player.getUUID())) continue;
 
@@ -404,36 +416,29 @@ public class PortalManager {
                 CretaniaSync.LOGGER.info("[Cretania-Portales] {} entró al portal '{}' → {}",
                         player.getGameProfile().getName(), p.name(), p.targetServer());
 
-                // Pseudo-servidor "local": RTP dentro de este mismo server, sin pasar
+                // Destino literal e instantáneo: coords configuradas si existen,
+                // si no, el propio bloque del portal (sin RTP, sin búsqueda de terreno).
+                double tx = p.hasTargetCoords() ? p.targetX() : p.landingX();
+                double ty = p.hasTargetCoords() ? p.targetY() : p.landingY();
+                double tz = p.hasTargetCoords() ? p.targetZ() : p.landingZ();
+                float tyaw = p.targetYaw() != null ? p.targetYaw() : player.getYRot();
+                float tpitch = p.targetPitch() != null ? p.targetPitch() : player.getXRot();
+
+                // Pseudo-servidor "local": TP dentro de este mismo server, sin pasar
                 // por Velocity (reemplaza a las antiguas zonas local_rtp).
                 if ("local".equalsIgnoreCase(p.targetServer())) {
-                    int r = p.isRtp() ? p.rtpRadius() : DEFAULT_RTP_RADIUS;
-                    double rx = (Math.random() * 2 - 1) * r;
-                    double rz = (Math.random() * 2 - 1) * r;
                     ReturnZoneManager.markTransferring(player.getUUID(), 8_000);
                     player.displayClientMessage(Component.literal("Teletransportando...")
                             .withStyle(ChatFormatting.LIGHT_PURPLE), true);
-                    // applyTeleport con Y=320 busca top non-air block + 1 (sky marker)
                     com.cretania.invsync.network.SyncChannelHandler.applyTeleport(
-                            player, rx, 320.0, rz, 0f, 0f);
+                            player, tx, ty, tz, tyaw, tpitch);
                     break;
                 }
 
                 player.displayClientMessage(Component.literal("Conectando a " + p.targetServer() + "...")
                         .withStyle(ChatFormatting.LIGHT_PURPLE), true);
 
-                if (p.isRtp()) {
-                    // RTP: X/Z aleatorio en [-radio, +radio], Y=320 (el destino busca top block)
-                    int r = p.rtpRadius();
-                    double rx = (Math.random() * 2 - 1) * r;
-                    double rz = (Math.random() * 2 - 1) * r;
-                    ReturnZoneManager.initiateReturn(player, p.targetServer(), rx, 320.0, rz, 0f, 0f);
-                } else if (p.hasTargetCoords()) {
-                    ReturnZoneManager.initiateReturn(player, p.targetServer(),
-                            p.targetX(), p.targetY(), p.targetZ(), p.targetYaw(), p.targetPitch());
-                } else {
-                    ReturnZoneManager.initiateReturn(player, p.targetServer(), null, null, null, null, null);
-                }
+                ReturnZoneManager.initiateReturnImmediate(player, p.targetServer(), tx, ty, tz, tyaw, tpitch);
                 break;
             }
         }
@@ -537,7 +542,7 @@ public class PortalManager {
                                                 return 0;
                                             }
                                             ctx.getSource().sendSuccess(() -> Component.literal(
-                                                    "Portal '" + name + "': coords destino eliminadas (spawn default).")
+                                                    "Portal '" + name + "': coords destino eliminadas (TP instantáneo al propio portal).")
                                                     .withStyle(ChatFormatting.YELLOW), true);
                                             return 1;
                                         }))
@@ -559,23 +564,6 @@ public class PortalManager {
                                                                                 DoubleArgumentType.getDouble(ctx, "z"),
                                                                                 FloatArgumentType.getFloat(ctx, "yaw"),
                                                                                 FloatArgumentType.getFloat(ctx, "pitch"))))))))))
-                .then(Commands.literal("rtp")
-                        .then(Commands.argument("nombre", StringArgumentType.word())
-                                .suggests(portalSuggestions)
-                                .then(Commands.argument("radio", IntegerArgumentType.integer(0))
-                                        .executes(ctx -> {
-                                            String name = StringArgumentType.getString(ctx, "nombre");
-                                            int radio = IntegerArgumentType.getInteger(ctx, "radio");
-                                            PortalDef def = setRtpRadius(name, radio);
-                                            if (def == null) {
-                                                ctx.getSource().sendFailure(Component.literal("No existe el portal '" + name + "'."));
-                                                return 0;
-                                            }
-                                            ctx.getSource().sendSuccess(() -> Component.literal(
-                                                    "Portal '" + name + "': " + (radio <= 0 ? "RTP desactivado." : "RTP radio " + radio + "."))
-                                                    .withStyle(ChatFormatting.GREEN), true);
-                                            return 1;
-                                        }))))
                 .then(Commands.literal("servidores")
                         .executes(ctx -> {
                             ctx.getSource().sendSuccess(() -> Component.literal(

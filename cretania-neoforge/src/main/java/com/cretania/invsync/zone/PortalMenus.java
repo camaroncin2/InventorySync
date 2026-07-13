@@ -82,8 +82,10 @@ public class PortalMenus {
                         text("enciéndelo y usa el botón verde.", ChatFormatting.GRAY),
                         text("Todo se administra desde este menú;", ChatFormatting.GRAY),
                         text("los cambios aplican al instante.", ChatFormatting.GRAY),
-                        text("Server 'local' = RTP aleatorio", ChatFormatting.DARK_GRAY),
-                        text("dentro de este mismo server.", ChatFormatting.DARK_GRAY))));
+                        text("El TP es siempre instantáneo: a las", ChatFormatting.DARK_GRAY),
+                        text("coords configuradas o al propio", ChatFormatting.DARK_GRAY),
+                        text("bloque del portal. Server 'local' =", ChatFormatting.DARK_GRAY),
+                        text("teletransporta en este mismo server.", ChatFormatting.DARK_GRAY))));
         container.setItem(SLOT_CLOSE, named(new ItemStack(Items.BARRIER),
                 text("Cerrar", ChatFormatting.RED), List.of()));
         container.setItem(SLOT_CREATE, named(new ItemStack(Items.EMERALD_BLOCK),
@@ -163,7 +165,7 @@ public class PortalMenus {
                 List.of(text("Escribe el nombre del server", ChatFormatting.GRAY),
                         text("(el registrado en Velocity) y", ChatFormatting.GRAY),
                         text("se asigna a este portal.", ChatFormatting.GRAY),
-                        text("Usa 'local' para RTP local.", ChatFormatting.DARK_GRAY))));
+                        text("Usa 'local' para TP en este server.", ChatFormatting.DARK_GRAY))));
 
         container.setItem(SLOT_BACK, named(new ItemStack(Items.ARROW),
                 text("Volver", ChatFormatting.WHITE), List.of()));
@@ -172,14 +174,14 @@ public class PortalMenus {
                 List.of(text("Nombre actual: " + portal.name(), ChatFormatting.GRAY))));
         container.setItem(SLOT_MODE, named(new ItemStack(Items.COMPASS),
                 text("Modo destino: " + portal.modeDescription(), ChatFormatting.GOLD),
-                List.of(text("Click: ciclar radio RTP", ChatFormatting.YELLOW),
-                        text("off → 250 → 500 → 1000 → 2500", ChatFormatting.GRAY),
-                        text("→ 5000 → 10000 → off", ChatFormatting.GRAY))));
+                List.of(text("Configura las coords destino con", ChatFormatting.GRAY),
+                        text("el botón 'Coords destino'.", ChatFormatting.GRAY),
+                        text("Sin coords: TP al propio portal.", ChatFormatting.DARK_GRAY))));
         container.setItem(SLOT_COORDS, named(new ItemStack(Items.LODESTONE),
                 text("Coords destino", ChatFormatting.GOLD),
                 List.of(text(portal.hasTargetCoords()
                                 ? String.format(Locale.US, "Actual: %.1f %.1f %.1f", portal.targetX(), portal.targetY(), portal.targetZ())
-                                : "Actual: spawn del servidor", ChatFormatting.GRAY),
+                                : "Actual: propio portal (instantáneo)", ChatFormatting.GRAY),
                         text("Click y escribe: x y z", ChatFormatting.YELLOW),
                         text("(opcional: x y z yaw pitch)", ChatFormatting.GRAY),
                         text("Escribe 'clear' para quitar.", ChatFormatting.GRAY))));
@@ -214,9 +216,6 @@ public class PortalMenus {
                 } else if (slot == SLOT_RENAME) {
                     openTextInput(clicker, "Nuevo nombre", name,
                             (sp, text) -> handleRenameInput(sp, name, text));
-                } else if (slot == SLOT_MODE) {
-                    PortalManager.cycleRtpPreset(name);
-                    openPortal(clicker, name);
                 } else if (slot == SLOT_COORDS) {
                     openTextInput(clicker, "Coords: x y z (yaw pitch)",
                             portal.hasTargetCoords()
@@ -270,7 +269,7 @@ public class PortalMenus {
         String text = rawText.trim().toLowerCase(Locale.ROOT);
         if (text.isEmpty() || text.equals("clear") || text.equals("-") || text.equals("x y z")) {
             PortalManager.setTargetCoords(portalName, null, null, null, null, null);
-            player.sendSystemMessage(text("Portal '" + portalName + "': coords eliminadas (spawn default).",
+            player.sendSystemMessage(text("Portal '" + portalName + "': coords eliminadas (TP instantáneo al propio portal).",
                     ChatFormatting.YELLOW));
             openPortal(player, portalName);
             return;

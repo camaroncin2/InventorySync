@@ -404,6 +404,7 @@ public class InventorySync {
             }
 
             var skinClientPayload = new SkinClientPayload(uuid, value, signature);
+            List<ServerPlayer> needsFallback = new java.util.ArrayList<>();
             int payloadSent = 0;
             for (ServerPlayer other : server.getPlayerList().getPlayers()) {
                 try {
@@ -411,42 +412,51 @@ public class InventorySync {
                     payloadSent++;
                 } catch (Exception ignored) {
                     // Cliente sin cretania-client → usará el fallback legacy de abajo
+                    if (!other.getUUID().equals(uuid)) needsFallback.add(other);
                 }
             }
 
-            var removePacket = new ClientboundPlayerInfoRemovePacket(List.of(uuid));
-            var addPacket = new ClientboundPlayerInfoUpdatePacket(
-                    java.util.EnumSet.of(
-                            ClientboundPlayerInfoUpdatePacket.Action.ADD_PLAYER,
-                            ClientboundPlayerInfoUpdatePacket.Action.UPDATE_GAME_MODE,
-                            ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LISTED,
-                            ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LATENCY
-                    ),
-                    java.util.List.of(player)
-            );
+            if (!needsFallback.isEmpty()) {
+                var removePacket = new ClientboundPlayerInfoRemovePacket(List.of(uuid));
+                var addPacket = new ClientboundPlayerInfoUpdatePacket(
+                        java.util.EnumSet.of(
+                                ClientboundPlayerInfoUpdatePacket.Action.ADD_PLAYER,
+                                ClientboundPlayerInfoUpdatePacket.Action.UPDATE_GAME_MODE,
+                                ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LISTED,
+                                ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LATENCY
+                        ),
+                        java.util.List.of(player)
+                );
 
-            for (ServerPlayer other : server.getPlayerList().getPlayers()) {
-                if (other.getUUID().equals(uuid)) continue; // el propio se refresca vía SkinClientPayload
-                try {
-                    other.connection.send(removePacket);
-                    other.connection.send(addPacket);
-                    other.connection.send(new ClientboundRemoveEntitiesPacket(player.getId()));
-                    other.connection.send(new ClientboundAddEntityPacket(
-                            player.getId(), uuid,
-                            player.getX(), player.getY(), player.getZ(),
-                            player.getXRot(), player.getYRot(),
-                            player.getType(), 0,
-                            player.getDeltaMovement(), player.getYHeadRot()
-                    ));
-                } catch (Exception e) {
-                    CretaniaSync.LOGGER.warn("[Cretania] Error refrescando skin para {}: {}",
-                            other.getGameProfile().getName(), e.getMessage());
+                // Fallback SOLO para clientes que no recibieron el payload limpio (sin cretania-client).
+                // Recrear la entidad sin re-sincronizar su SynchedEntityData puede dejarla sin
+                // renderizar (jugador invisible) — por eso antes NO se aplicaba a todos.
+                for (ServerPlayer other : needsFallback) {
+                    try {
+                        other.connection.send(removePacket);
+                        other.connection.send(addPacket);
+                        other.connection.send(new ClientboundRemoveEntitiesPacket(player.getId()));
+                        other.connection.send(new ClientboundAddEntityPacket(
+                                player.getId(), uuid,
+                                player.getX(), player.getY(), player.getZ(),
+                                player.getXRot(), player.getYRot(),
+                                player.getType(), 0,
+                                player.getDeltaMovement(), player.getYHeadRot()
+                        ));
+                        var nonDefaultData = player.getEntityData().getNonDefaultValues();
+                        if (nonDefaultData != null) {
+                            other.connection.send(new net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket(
+                                    player.getId(), nonDefaultData));
+                        }
+                    } catch (Exception e) {
+                        CretaniaSync.LOGGER.warn("[Cretania] Error refrescando skin para {}: {}",
+                                other.getGameProfile().getName(), e.getMessage());
+                    }
                 }
             }
 
             CretaniaSync.LOGGER.info("[Cretania] Skin aplicada para {} ({} clientes vía SkinClientPayload, fallback a {} otros)",
-                    player.getGameProfile().getName(), payloadSent,
-                    Math.max(0, server.getPlayerList().getPlayers().size() - 1));
+                    player.getGameProfile().getName(), payloadSent, needsFallback.size());
         });
     }
 }

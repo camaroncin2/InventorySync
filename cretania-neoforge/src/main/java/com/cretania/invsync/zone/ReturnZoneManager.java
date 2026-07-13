@@ -162,9 +162,26 @@ public class ReturnZoneManager {
     // Transferencia de retorno
     // -------------------------------------------------------------------------
 
-    /** Package-private: también lo usa PortalManager para los portales físicos. */
+    /** Package-private: usado por la zona "outside". Mantiene el margen anti-bucle de 2s. */
     static void initiateReturn(ServerPlayer player, String targetServer,
                                Double tx, Double ty, Double tz, Float tyaw, Float tpitch) {
+        initiateReturn(player, targetServer, tx, ty, tz, tyaw, tpitch, 2_000);
+    }
+
+    /**
+     * Usado por PortalManager para los portales físicos: sin margen previo. A diferencia
+     * de la zona "outside" (que dispara por posición y puede re-entrar en bucle si el
+     * jugador no se aleja), un portal requiere que el jugador vuelva a pisar los bloques
+     * para disparar de nuevo, así que no hace falta el delay anti-bucle.
+     */
+    static void initiateReturnImmediate(ServerPlayer player, String targetServer,
+                               Double tx, Double ty, Double tz, Float tyaw, Float tpitch) {
+        initiateReturn(player, targetServer, tx, ty, tz, tyaw, tpitch, 0);
+    }
+
+    private static void initiateReturn(ServerPlayer player, String targetServer,
+                               Double tx, Double ty, Double tz, Float tyaw, Float tpitch,
+                               long preDelayMillis) {
         TRANSFERRING.add(player.getUUID());
         CretaniaSync.LOGGER.info("[Cretania-Zones] {} → {} (pos actual: {},{},{}{})",
                 player.getGameProfile().getName(), targetServer,
@@ -189,10 +206,9 @@ public class ReturnZoneManager {
         // IMPORTANTE: CompletableFuture.runAsync() para que los sleeps ocurran en un hilo
         // del ForkJoinPool y NUNCA bloqueen el server thread.
         CompletableFuture.runAsync(() -> {
-            // Delay de 2 s antes de conectar al otro servidor.
-            // Esto da tiempo al jugador de alejarse de la frontera de la zona y evita
-            // que en lobby su posición caiga dentro del trigger de zona y provoque el bucle.
-            try { Thread.sleep(2_000); } catch (InterruptedException ignored) {}
+            if (preDelayMillis > 0) {
+                try { Thread.sleep(preDelayMillis); } catch (InterruptedException ignored) {}
+            }
 
             // Enviar via socket local a Velocity (IPv4 explícito para compatibilidad Java 21/25)
             try (Socket socket = new Socket("127.0.0.1", SOCKET_PORT)) {

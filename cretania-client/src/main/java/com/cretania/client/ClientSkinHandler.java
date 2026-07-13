@@ -171,7 +171,7 @@ public class ClientSkinHandler {
         PlayerInfo info = mc.getConnection().getPlayerInfo(uuid);
         if (info == null) {
             // PlayerInfo aún no existe (join en progreso); el EntityJoinLevelEvent lo reintentará
-            LOGGER.debug("[CretaniaClient] PlayerInfo no disponible aún para {}", uuid);
+            LOGGER.warn("[CretaniaClient] applyToConnection: PlayerInfo no disponible aún para {} — se reintentará en EntityJoinLevelEvent", uuid);
             return;
         }
 
@@ -226,34 +226,46 @@ public class ClientSkinHandler {
     private static void invalidateSkinManagerCache(Minecraft mc, UUID uuid) {
         try {
             Object skinMgr = mc.getSkinManager();
+            int fieldsInspected = 0;
+            int entriesRemoved = 0;
             for (Class<?> c = skinMgr.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
                 for (Field f : c.getDeclaredFields()) {
                     f.setAccessible(true);
+                    fieldsInspected++;
                     try {
                         Object val = f.get(skinMgr);
                         if (val == null) continue;
 
                         // Caso 1: Map<UUID, ?> directo (ej. ConcurrentHashMap)
                         if (val instanceof Map<?, ?> map) {
-                            map.remove(uuid);
+                            if (map.remove(uuid) != null) entriesRemoved++;
                         }
 
                         // Caso 2: Guava LoadingCache — exponer como Map vía asMap()
                         try {
                             Method asMapMethod = val.getClass().getMethod("asMap");
                             Map<?, ?> view = (Map<?, ?>) asMapMethod.invoke(val);
+                            int before = view.size();
                             view.entrySet().removeIf(e -> {
                                 Object key = e.getKey();
                                 return uuid.equals(key)
                                         || (key instanceof GameProfile gp && uuid.equals(gp.getId()));
                             });
+                            entriesRemoved += before - view.size();
                         } catch (NoSuchMethodException ignored) {
                             // No es un Guava Cache
                         }
-                    } catch (Exception ignored) {}
+                    } catch (Exception e) {
+                        LOGGER.warn("[CretaniaClient] invalidateSkinManagerCache: fallo leyendo campo '{}' ({}) de {}: {}",
+                                f.getName(), f.getType().getSimpleName(), c.getSimpleName(), e);
+                    }
                 }
             }
-        } catch (Exception ignored) {}
+            LOGGER.info("[CretaniaClient] invalidateSkinManagerCache({}): {} campos inspeccionados, {} entradas eliminadas de SkinManager={}",
+                    uuid, fieldsInspected, entriesRemoved, skinMgr.getClass().getName());
+        } catch (Exception e) {
+            LOGGER.warn("[CretaniaClient] invalidateSkinManagerCache: fallo total obteniendo SkinManager para {}: {}", uuid, e);
+        }
     }
 
     /**
@@ -263,17 +275,24 @@ public class ClientSkinHandler {
      * sin depender de nombres de campo (que sí cambian con obfuscation).
      */
     private static void clearFieldsOfSimpleType(Object obj, String simpleTypeName) {
+        boolean foundAny = false;
         for (Class<?> c = obj.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
             for (Field field : c.getDeclaredFields()) {
                 if (field.getType().getSimpleName().equals(simpleTypeName)) {
+                    foundAny = true;
                     try {
                         field.setAccessible(true);
                         field.set(obj, null);
-                    } catch (Exception ignored) {
-                        // InaccessibleObjectException en ciertos JVMs: no fatal
+                    } catch (Exception e) {
+                        LOGGER.warn("[CretaniaClient] clearFieldsOfSimpleType: no se pudo limpiar campo '{}' tipo {} en {}: {}",
+                                field.getName(), simpleTypeName, obj.getClass().getSimpleName(), e);
                     }
                 }
             }
+        }
+        if (!foundAny) {
+            LOGGER.warn("[CretaniaClient] clearFieldsOfSimpleType: ningún campo de tipo '{}' encontrado en {} — el cliente puede tener una clase distinta a la esperada",
+                    simpleTypeName, obj.getClass().getName());
         }
     }
 
