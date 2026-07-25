@@ -33,6 +33,27 @@ public class SyncChannelHandler {
      */
     public static final ConcurrentHashMap<UUID, double[]> PENDING_TELEPORTS = new ConcurrentHashMap<>();
 
+    /**
+     * uuid → epoch ms hasta cuando se considera que el jugador llegó por un portal.
+     * restoreLastPositionOnLogin lo consulta para NO pisar la posición del portal con la
+     * última posición guardada. Ventana corta: solo cubre el momento del login.
+     */
+    private static final ConcurrentHashMap<UUID, Long> PORTAL_ARRIVAL = new ConcurrentHashMap<>();
+
+    public static void markPortalArrival(UUID uuid) {
+        PORTAL_ARRIVAL.put(uuid, System.currentTimeMillis() + 5_000L);
+    }
+
+    public static boolean cameFromPortal(UUID uuid) {
+        Long expiry = PORTAL_ARRIVAL.get(uuid);
+        if (expiry == null) return false;
+        if (System.currentTimeMillis() > expiry) {
+            PORTAL_ARRIVAL.remove(uuid);
+            return false;
+        }
+        return true;
+    }
+
     public static void sendSaveComplete(UUID uuid, String playerName, String scope, String serverName) {
         String message = MSG_SAVE_COMPLETE + MSG_SEPARATOR
                 + uuid + MSG_SEPARATOR
@@ -92,6 +113,7 @@ public class SyncChannelHandler {
                             float  yaw   = Float.parseFloat(parts[5]);
                             float  pitch = Float.parseFloat(parts[6]);
                             PENDING_TELEPORTS.put(uuid, new double[]{x, y, z, yaw, pitch});
+                            markPortalArrival(uuid); // llegó por portal → no restaurar última posición encima
                             CretaniaSync.LOGGER.info("[Cretania-Zone] SET_POSITION recibido para {} → ({},{},{})", uuid, x, y, z);
                             // Si el jugador ya está en el servidor, teleportarlo de inmediato
                             MinecraftServer server = CretaniaSync.getInstance().getServer();

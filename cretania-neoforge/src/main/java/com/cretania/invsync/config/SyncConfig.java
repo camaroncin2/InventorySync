@@ -17,11 +17,14 @@ public class SyncConfig {
     public final ModConfigSpec.IntValue syncTimeoutSeconds;
     public final ModConfigSpec.BooleanValue kickOnFailure;
     public final ModConfigSpec.BooleanValue clearInventoryWhenNotSynced;
+    public final ModConfigSpec.IntValue autosaveSeconds;
+    public final ModConfigSpec.BooleanValue restoreLastPositionOnLogin;
 
     // Forced spawn: si está habilitado, TODO jugador que entra al server (login,
     // /server tiendas, transfer, comando) aparece en estas coordenadas. Sobrescribe
     // cualquier SET_POSITION pendiente y las coords guardadas en su perfil.
     public final ModConfigSpec.BooleanValue forcedSpawnEnabled;
+    public final ModConfigSpec.BooleanValue forcedSpawnUseWorldSpawn;
     public final ModConfigSpec.DoubleValue forcedSpawnX;
     public final ModConfigSpec.DoubleValue forcedSpawnY;
     public final ModConfigSpec.DoubleValue forcedSpawnZ;
@@ -79,19 +82,43 @@ public class SyncConfig {
                 .comment("Disconnect the player if sync fails.")
                 .define("kickOnFailure", true);
 
+        autosaveSeconds = builder
+                .comment("""
+                        Segundos entre autoguardados del inventario de los jugadores conectados.
+                        Es la ÚNICA red contra un crash duro (kill -9, OOM, corte de luz): sin esto
+                        se pierde todo lo hecho desde el último login. 0 = desactivado (NO recomendado).""")
+                .defineInRange("autosaveSeconds", 120, 0, 3600);
+
+        restoreLastPositionOnLogin = builder
+                .comment("""
+                        Al reconectarse (login que NO viene por un portal), devolver al jugador a la
+                        última posición guardada — la de su última desconexión — en vez de aplicar el
+                        forced_spawn. Pensado para survival. Las llegadas por portal siempre usan las
+                        coords del portal, sin importar esta opción. Tiene prioridad sobre forced_spawn.""")
+                .define("restoreLastPositionOnLogin", false);
+
         builder.pop();
 
         builder.comment("""
-                Forced spawn
-                - Si enabled=true, todo jugador al entrar al servidor se TP a estas coords,
-                  sin importar si viene por /server, comando o transferencia desde otro server.
+                Forced spawn — SOLO se aplica a los logins normales.
+                - Si enabled=true, el jugador que entra al servidor aparece en el spawn del
+                  mundo (useWorldSpawn=true) o en las coords x/y/z (useWorldSpawn=false),
+                  en vez de en la posición donde se desconectó.
+                - NO afecta a quien llega por un portal: esas llegadas usan las coords
+                  configuradas en el portal de origen y tienen prioridad.
                 - Útil para tiendas / lobbies con punto de entrada fijo.
                 """);
         builder.push("forced_spawn");
 
         forcedSpawnEnabled = builder
-                .comment("Forzar spawn en coordenadas fijas para todos los jugadores al entrar.")
+                .comment("Forzar el punto de aparición en los logins normales (no afecta a los portales).")
                 .define("enabled", false);
+
+        forcedSpawnUseWorldSpawn = builder
+                .comment("""
+                        true  = usar el spawn del mundo (el de /setworldspawn, dinámico).
+                        false = usar las coordenadas x/y/z de abajo.""")
+                .define("useWorldSpawn", false);
 
         forcedSpawnX = builder
                 .comment("Coordenada X del spawn forzado.")

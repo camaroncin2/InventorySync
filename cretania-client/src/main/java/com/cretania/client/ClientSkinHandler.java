@@ -16,7 +16,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.Collection;
 import java.util.Map;
@@ -46,6 +45,8 @@ public class ClientSkinHandler {
         UUID uuid = payload.uuid();
         String value = payload.value();
         String signature = payload.signature();
+
+        LOGGER.debug("[CretaniaClient] SkinClientPayload recibido para {} ({} chars)", uuid, value.length());
 
         // Guardar en caché para persistencia cross-server
         SKIN_CACHE.put(uuid, new SkinData(value, signature));
@@ -85,48 +86,153 @@ public class ClientSkinHandler {
     public static void onPlayerLogin(ClientPlayerNetworkEvent.LoggingIn event) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.player == null) return;
+        if (mc.hasSingleplayerServer()) return; // en mundos locales no hay nada que probar
         try {
             UUID ownUuid = mc.player.getUUID();
 
-            // Primero: verificar si hay skin personalizada en caché (ej. de /skin Notch).
-            // Esto garantiza que la skin custom persista al cambiar de servidor.
+            // 1. PRIORIDAD: la textura FIRMADA por Mojang del GameProfile local (sesión
+            //    premium real). Antes se enviaba primero la caché — pero AuthMod mete su
+            //    CRACKED_SKIN en esa caché incluso para jugadores premium, así que al
+            //    reconectar se re-enviaba una skin sin firma que el servidor persistía
+            //    como "cracked", PISANDO la skin premium en la base. Ese era el motivo de
+            //    que las skins premium se perdieran tras reinicios/reconexiones.
+            Collection<Property> textures = mc.player.getGameProfile().getProperties().get("textures");
+            if (textures != null && !textures.isEmpty()) {
+                Property prop = textures.iterator().next();
+                if (prop.hasSignature() && !prop.value().isBlank()) {
+                    sendOwnSkin(prop.value(), prop.signature(), "GameProfile firmado");
+                    return;
+                }
+            }
+
+            // Sin firma local. Minecraft descarga el perfil propio de Mojang UNA sola vez
+            // al arrancar el juego: si esa descarga falló (red inestable, rate-limit), la
+            // sesión queda SIN textura firmada para siempre aunque la cuenta Microsoft
+            // esté iniciada — y el jugador premium nunca puede demostrarlo. Recuperación:
+            // pedirla nosotros mismos a sessionserver con el UUID real de la sesión.
+            startOwnProfileRecovery(mc);
+
+            // 2. Caché de sesión (skin custom / CRACKED_SKIN) — clientes sin firma propia.
             SkinData cachedSkin = SKIN_CACHE.get(ownUuid);
             if (cachedSkin != null) {
-                String message = "C2S_SKIN:" + cachedSkin.value() + ":" + cachedSkin.signature();
-                PacketDistributor.sendToServer(
-                        new ClientSyncPayload(message.getBytes(StandardCharsets.UTF_8))
-                );
-                PacketDistributor.sendToServer(
-                        new ClientAuthChannelPayload(message.getBytes(StandardCharsets.UTF_8))
-                );
-                LOGGER.info("[CretaniaClient] C2S_SKIN (desde caché) enviada al servidor ({} chars)", cachedSkin.value().length());
+                sendOwnSkin(cachedSkin.value(), cachedSkin.signature(), "caché");
                 return;
             }
 
-            // Fallback: leer skin del GameProfile local (jugadores premium).
-            Collection<Property> textures = mc.player.getGameProfile().getProperties().get("textures");
-            if (textures == null || textures.isEmpty()) {
-                LOGGER.debug("[CretaniaClient] Sin skin en GameProfile local — se omite C2S_SKIN");
-                return;
+            // 3. Último recurso: textura sin firmar del GameProfile (algunos launchers la inyectan).
+            if (textures != null && !textures.isEmpty()) {
+                Property prop = textures.iterator().next();
+                if (!prop.value().isBlank()) {
+                    sendOwnSkin(prop.value(), "", "GameProfile sin firma");
+                    return;
+                }
             }
-            Property prop = textures.iterator().next();
-            String value = prop.value();
-            String signature = prop.hasSignature() ? prop.signature() : "";
-            if (value.isBlank()) return;
-
-            String message = "C2S_SKIN:" + value + ":" + signature;
-            PacketDistributor.sendToServer(
-                    new ClientSyncPayload(message.getBytes(StandardCharsets.UTF_8))
-            );
-            // También enviar vía authmod:check para que AuthMod la cachee antes del /login.
-            // Esto permite asignar skin al instante sin esperar Mojang API.
-            PacketDistributor.sendToServer(
-                    new ClientAuthChannelPayload(message.getBytes(StandardCharsets.UTF_8))
-            );
-            LOGGER.info("[CretaniaClient] C2S_SKIN enviada al servidor ({} chars valor)", value.length());
+            LOGGER.debug("[CretaniaClient] Sin skin local — se omite C2S_SKIN");
         } catch (Exception e) {
             LOGGER.warn("[CretaniaClient] Error enviando C2S_SKIN: {}", e.getMessage());
         }
+    }
+
+    /** Evita lanzar dos recuperaciones en paralelo. */
+    private static final java.util.concurrent.atomic.AtomicBoolean RECOVERY_IN_FLIGHT =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * Recupera la textura firmada de la PROPIA cuenta desde sessionserver.mojang.com,
+     * usando el UUID real de la sesión iniciada (no el offline del servidor). Si la
+     * cuenta es premium, la textura llega firmada y se envía como prueba (authmod:check
+     * + cretania:sync). Para cuentas no premium el perfil no existe (404) y no pasa nada.
+     */
+    private static void startOwnProfileRecovery(Minecraft mc) {
+        if (!RECOVERY_IN_FLIGHT.compareAndSet(false, true)) return;
+        Thread t = new Thread(() -> {
+            try {
+                UUID sessionId = mc.getUser().getProfileId();
+                LOGGER.info("[CretaniaClient] Perfil local sin textura firmada — consultando sessionserver para {}...", sessionId);
+                var result = mc.getMinecraftSessionService().fetchProfile(sessionId, true);
+                if (result == null) {
+                    LOGGER.info("[CretaniaClient] sessionserver no conoce {} — cuenta no premium, sin prueba que enviar.", sessionId);
+                    return;
+                }
+                Collection<Property> texs = result.profile().getProperties().get("textures");
+                if (texs == null || texs.isEmpty()) {
+                    LOGGER.warn("[CretaniaClient] Perfil de {} recuperado pero sin texturas.", sessionId);
+                    return;
+                }
+                Property prop = texs.iterator().next();
+                if (!prop.hasSignature() || prop.value().isBlank()) {
+                    LOGGER.warn("[CretaniaClient] Perfil de {} recuperado pero la textura no viene firmada.", sessionId);
+                    return;
+                }
+                mc.execute(() -> {
+                    if (mc.getConnection() == null) return; // ya se desconectó
+                    sendOwnSkin(prop.value(), prop.signature(), "sessionserver (recuperada)");
+                });
+            } catch (Exception e) {
+                LOGGER.warn("[CretaniaClient] Recuperación de perfil propio falló: {}", e.toString());
+            } finally {
+                RECOVERY_IN_FLIGHT.set(false);
+            }
+        }, "cretania-own-profile");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Envía la skin propia por ambos canales (cretania:sync + authmod:check). */
+    private static void sendOwnSkin(String value, String signature, String source) {
+        String message = "C2S_SKIN:" + value + ":" + (signature == null ? "" : signature);
+        PacketDistributor.sendToServer(new ClientSyncPayload(message.getBytes(StandardCharsets.UTF_8)));
+        // También vía authmod:check para que AuthMod la cachee antes del /login.
+        PacketDistributor.sendToServer(new ClientAuthChannelPayload(message.getBytes(StandardCharsets.UTF_8)));
+        LOGGER.info("[CretaniaClient] C2S_SKIN enviada al servidor ({} chars, origen: {})", value.length(), source);
+
+        // Programar reenvíos de la prueba por authmod:check: el envío único original
+        // corría una carrera con el chequeo de AuthMod en el servidor — si AuthMod
+        // evaluaba antes de que llegara este paquete, caía a su vía lenta (API de
+        // Mojang, 30-60 s). Reenviando en los primeros segundos, AuthMod recibe la
+        // skin firmada aunque el primer paquete haya perdido la carrera.
+        authResendMessage = message;
+        authResendTicks = 0;
+    }
+
+    // ─────────────── Reenvío de la prueba premium (authmod:check) ───────────────
+
+    private static volatile String authResendMessage = null;
+    private static int authResendTicks = 0;
+    /** Ticks (tras el login) en los que se reenvía: 1 s, 3 s y 7 s. */
+    private static final int[] AUTH_RESEND_AT = {20, 60, 140};
+
+    @SubscribeEvent
+    public static void onClientTick(net.neoforged.neoforge.client.event.ClientTickEvent.Post event) {
+        if (authResendMessage == null) return;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.getConnection() == null || mc.player == null) {
+            authResendMessage = null;
+            return;
+        }
+
+        authResendTicks++;
+        for (int at : AUTH_RESEND_AT) {
+            if (authResendTicks == at) {
+                try {
+                    PacketDistributor.sendToServer(new ClientAuthChannelPayload(
+                            authResendMessage.getBytes(StandardCharsets.UTF_8)));
+                    LOGGER.debug("[CretaniaClient] Prueba authmod:check reenviada (tick {})", at);
+                } catch (Exception e) {
+                    LOGGER.debug("[CretaniaClient] Reenvío authmod:check falló: {}", e.toString());
+                    authResendMessage = null;
+                }
+                break;
+            }
+        }
+        if (authResendTicks > AUTH_RESEND_AT[AUTH_RESEND_AT.length - 1]) {
+            authResendMessage = null;
+        }
+    }
+
+    @SubscribeEvent
+    public static void onLoggingOut(ClientPlayerNetworkEvent.LoggingOut event) {
+        authResendMessage = null;
     }
 
     /**
@@ -150,6 +256,17 @@ public class ClientSkinHandler {
             String value = parts[2];
             String signature = parts[3];
 
+            // Una skin SIN firma nunca reemplaza una skin FIRMADA ya conocida para ese
+            // jugador: AuthMod manda CRACKED_SKIN también a cuentas premium, y aceptarla
+            // degradaba la skin premium (visualmente y, vía re-envío, en la base).
+            SkinData existing = SKIN_CACHE.get(uuid);
+            boolean incomingSigned = !signature.isBlank();
+            boolean existingSigned = existing != null && existing.signature() != null && !existing.signature().isBlank();
+            if (existingSigned && !incomingSigned) {
+                LOGGER.info("[CretaniaClient] CRACKED_SKIN sin firma para {} ignorada — ya hay skin firmada.", uuid);
+                return;
+            }
+
             SKIN_CACHE.put(uuid, new SkinData(value, signature));
             LOGGER.info("[CretaniaClient] CRACKED_SKIN recibida para {}, aplicando...", uuid);
             applyToConnection(uuid, value, signature);
@@ -171,12 +288,16 @@ public class ClientSkinHandler {
         PlayerInfo info = mc.getConnection().getPlayerInfo(uuid);
         if (info == null) {
             // PlayerInfo aún no existe (join en progreso); el EntityJoinLevelEvent lo reintentará
-            LOGGER.warn("[CretaniaClient] applyToConnection: PlayerInfo no disponible aún para {} — se reintentará en EntityJoinLevelEvent", uuid);
+            LOGGER.debug("[CretaniaClient] applyToConnection: PlayerInfo no disponible aún para {} — se reintentará en EntityJoinLevelEvent", uuid);
             return;
         }
 
         // 1. Inyectar textura premium en el GameProfile del PlayerInfo
         GameProfile profile = info.getProfile();
+        if (!uuid.equals(profile.getId())) {
+            LOGGER.warn("[CretaniaClient] applyToConnection: MISMATCH — pedí PlayerInfo de {} pero su GameProfile tiene id={} name={}",
+                    uuid, profile.getId(), profile.getName());
+        }
         profile.getProperties().removeAll("textures");
         if (signature != null && !signature.isEmpty()) {
             profile.getProperties().put("textures", new Property("textures", value, signature));
@@ -184,115 +305,42 @@ public class ClientSkinHandler {
             profile.getProperties().put("textures", new Property("textures", value));
         }
 
-        // 2. Invalidar el caché del SkinManager: está keyed por UUID y devolvería la skin
-        //    anterior (o la default) si no lo limpiamos antes de la re-descarga.
-        invalidateSkinManagerCache(mc, uuid);
-
-        // 3. Limpiar el PlayerSkin cacheado en PlayerInfo para forzar re-descarga
-        clearFieldsOfSimpleType(info, "PlayerSkin");
-
-        // 4. Limpiar también cualquier caché en la entidad en el nivel
-        if (mc.level != null) {
-            for (AbstractClientPlayer player : mc.level.players()) {
-                if (player.getUUID().equals(uuid)) {
-                    clearFieldsOfSimpleType(player, "PlayerSkin");
-                    // 5. Para el jugador propio: limpiar también el PlayerInfo cacheado
-                    //    en AbstractClientPlayer. Sin esto, LocalPlayer.getPlayerInfo()
-                    //    devuelve el objeto cacheado y, aunque sus campos internos cambien,
-                    //    el SkinManager puede haber cacheado la PlayerSkin por identidad
-                    //    de PlayerInfo. Nulearlo fuerza un re-lookup en la connection map.
-                    if (mc.player != null && uuid.equals(mc.player.getUUID())) {
-                        clearFieldsOfSimpleType(player, "PlayerInfo");
-                    }
-                    break;
-                }
-            }
-        }
+        // 2. Reemplazar PlayerInfo.skinLookup por uno nuevo.
+        //    CAUSA RAÍZ real (confirmada por log): skinLookup es un Supplier<PlayerSkin>
+        //    memoizado UNA SOLA VEZ en el constructor de PlayerInfo (Suppliers.memoize).
+        //    Una vez que algo llama getSkin() la primera vez, el resultado queda fijo para
+        //    siempre — mutar el GameProfile después de eso no tiene ningún efecto, porque
+        //    el supplier memoizado ni siquiera vuelve a leer el profile. Limpiar cachés del
+        //    SkinManager (lo que se intentaba antes) no ayuda: el CompletableFuture ya
+        //    resuelto queda capturado directamente en el closure del supplier viejo.
+        replaceSkinLookup(mc, info, profile, uuid);
 
         LOGGER.debug("[CretaniaClient] Skin aplicada para {}", uuid);
     }
 
     /**
-     * Invalida el caché interno del SkinManager de Minecraft para el UUID dado.
-     *
-     * El SkinManager guarda un Future<PlayerSkin> keyed por UUID (o GameProfile).
-     * Si no lo eliminamos, la próxima llamada a getSkin() devuelve la skin cacheada
-     * (Steve/Alex por defecto) aunque el GameProfile ya tenga la textura correcta.
-     *
-     * Estrategia doble:
-     *   1. Elimina de cualquier Map<?> que esté keyed por UUID.
-     *   2. Elimina de caches Guava (expuestas via asMap()) keyed por UUID o GameProfile.
+     * Reemplaza PlayerInfo.skinLookup (privado y memoizado para siempre por Mojang) con un
+     * supplier fresco equivalente al que arma internamente PlayerInfo, pero construido con
+     * el GameProfile YA actualizado. AbstractClientPlayer.getSkin() delega en
+     * PlayerInfo.getSkin(), así que esto corrige tanto la vista de otros jugadores como la
+     * del jugador propio (mismo objeto PlayerInfo en ambos casos) sin tocar nada más.
      */
-    private static void invalidateSkinManagerCache(Minecraft mc, UUID uuid) {
+    private static void replaceSkinLookup(Minecraft mc, PlayerInfo info, GameProfile profile, UUID uuid) {
         try {
-            Object skinMgr = mc.getSkinManager();
-            int fieldsInspected = 0;
-            int entriesRemoved = 0;
-            for (Class<?> c = skinMgr.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-                for (Field f : c.getDeclaredFields()) {
-                    f.setAccessible(true);
-                    fieldsInspected++;
-                    try {
-                        Object val = f.get(skinMgr);
-                        if (val == null) continue;
-
-                        // Caso 1: Map<UUID, ?> directo (ej. ConcurrentHashMap)
-                        if (val instanceof Map<?, ?> map) {
-                            if (map.remove(uuid) != null) entriesRemoved++;
-                        }
-
-                        // Caso 2: Guava LoadingCache — exponer como Map vía asMap()
-                        try {
-                            Method asMapMethod = val.getClass().getMethod("asMap");
-                            Map<?, ?> view = (Map<?, ?>) asMapMethod.invoke(val);
-                            int before = view.size();
-                            view.entrySet().removeIf(e -> {
-                                Object key = e.getKey();
-                                return uuid.equals(key)
-                                        || (key instanceof GameProfile gp && uuid.equals(gp.getId()));
-                            });
-                            entriesRemoved += before - view.size();
-                        } catch (NoSuchMethodException ignored) {
-                            // No es un Guava Cache
-                        }
-                    } catch (Exception e) {
-                        LOGGER.warn("[CretaniaClient] invalidateSkinManagerCache: fallo leyendo campo '{}' ({}) de {}: {}",
-                                f.getName(), f.getType().getSimpleName(), c.getSimpleName(), e);
-                    }
-                }
-            }
-            LOGGER.info("[CretaniaClient] invalidateSkinManagerCache({}): {} campos inspeccionados, {} entradas eliminadas de SkinManager={}",
-                    uuid, fieldsInspected, entriesRemoved, skinMgr.getClass().getName());
+            java.util.function.Supplier<net.minecraft.client.resources.PlayerSkin> fresh = () -> {
+                java.util.concurrent.CompletableFuture<net.minecraft.client.resources.PlayerSkin> future =
+                        mc.getSkinManager().getOrLoad(profile);
+                net.minecraft.client.resources.PlayerSkin fallback =
+                        net.minecraft.client.resources.DefaultPlayerSkin.get(profile);
+                net.minecraft.client.resources.PlayerSkin resolved = future.getNow(fallback);
+                boolean remote = !mc.isLocalPlayer(profile.getId());
+                return remote && !resolved.secure() ? fallback : resolved;
+            };
+            Field field = PlayerInfo.class.getDeclaredField("skinLookup");
+            field.setAccessible(true);
+            field.set(info, fresh);
         } catch (Exception e) {
-            LOGGER.warn("[CretaniaClient] invalidateSkinManagerCache: fallo total obteniendo SkinManager para {}: {}", uuid, e);
-        }
-    }
-
-    /**
-     * Limpia todos los campos cuyo tipo tenga el nombre simple indicado,
-     * recorriendo la jerarquía de clases del objeto.
-     * Usado para borrar campos de tipo PlayerSkin (cuyo nombre no cambia entre builds)
-     * sin depender de nombres de campo (que sí cambian con obfuscation).
-     */
-    private static void clearFieldsOfSimpleType(Object obj, String simpleTypeName) {
-        boolean foundAny = false;
-        for (Class<?> c = obj.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-            for (Field field : c.getDeclaredFields()) {
-                if (field.getType().getSimpleName().equals(simpleTypeName)) {
-                    foundAny = true;
-                    try {
-                        field.setAccessible(true);
-                        field.set(obj, null);
-                    } catch (Exception e) {
-                        LOGGER.warn("[CretaniaClient] clearFieldsOfSimpleType: no se pudo limpiar campo '{}' tipo {} en {}: {}",
-                                field.getName(), simpleTypeName, obj.getClass().getSimpleName(), e);
-                    }
-                }
-            }
-        }
-        if (!foundAny) {
-            LOGGER.warn("[CretaniaClient] clearFieldsOfSimpleType: ningún campo de tipo '{}' encontrado en {} — el cliente puede tener una clase distinta a la esperada",
-                    simpleTypeName, obj.getClass().getName());
+            LOGGER.warn("[CretaniaClient] No se pudo reemplazar skinLookup para {}: {}", uuid, e);
         }
     }
 

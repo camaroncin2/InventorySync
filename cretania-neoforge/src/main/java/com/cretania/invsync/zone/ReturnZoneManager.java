@@ -52,18 +52,29 @@ public class ReturnZoneManager {
 
     private static final Set<UUID> TRANSFERRING = ConcurrentHashMap.newKeySet();
 
+    /**
+     * Hilos dedicados para el socket a Velocity. NUNCA usar el ForkJoinPool común aquí:
+     * antes cada transferencia dormía 6+ s un hilo de ese pool compartido, así que con
+     * varios jugadores cruzando a la vez el pool se agotaba y los envíos siguientes
+     * quedaban EN COLA detrás de hilos dormidos — por eso "tardaba y no los enviaba".
+     */
+    private static final java.util.concurrent.ExecutorService TRANSFER_EXECUTOR =
+            java.util.concurrent.Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "cretania-transfer");
+                t.setDaemon(true);
+                return t;
+            });
+
     /** Compartido con PortalManager: true si el jugador está en transferencia/gracia. */
     static boolean isTransferring(UUID uuid) {
         return TRANSFERRING.contains(uuid);
     }
 
-    /** Marca al jugador en transferencia/gracia y limpia el flag tras {@code millis} ms. */
+    /** Marca al jugador en transferencia/gracia y limpia el flag tras {@code millis} ms (sin bloquear hilos). */
     static void markTransferring(UUID uuid, long millis) {
         TRANSFERRING.add(uuid);
-        CompletableFuture.runAsync(() -> {
-            try { Thread.sleep(millis); } catch (InterruptedException ignored) {}
-            TRANSFERRING.remove(uuid);
-        });
+        CompletableFuture.delayedExecutor(millis, java.util.concurrent.TimeUnit.MILLISECONDS)
+                .execute(() -> TRANSFERRING.remove(uuid));
     }
 
     // -------------------------------------------------------------------------
@@ -203,14 +214,10 @@ public class ReturnZoneManager {
 
         final UUID uuid = player.getUUID();
 
-        // IMPORTANTE: CompletableFuture.runAsync() para que los sleeps ocurran en un hilo
-        // del ForkJoinPool y NUNCA bloqueen el server thread.
-        CompletableFuture.runAsync(() -> {
-            if (preDelayMillis > 0) {
-                try { Thread.sleep(preDelayMillis); } catch (InterruptedException ignored) {}
-            }
-
-            // Enviar via socket local a Velocity (IPv4 explícito para compatibilidad Java 21/25)
+        // Envío en hilos dedicados (nunca el server thread ni el commonPool). Sin delay,
+        // el socket sale de inmediato — cada jugador en su propio hilo, sin colas.
+        Runnable send = () -> {
+            // Socket local a Velocity (IPv4 explícito para compatibilidad Java 21/25)
             try (Socket socket = new Socket("127.0.0.1", SOCKET_PORT)) {
                 socket.setSoTimeout(3000);
                 OutputStream out = socket.getOutputStream();
@@ -219,10 +226,16 @@ public class ReturnZoneManager {
             } catch (Exception e) {
                 CretaniaSync.LOGGER.warn("[Cretania-Zones] No se pudo enviar TRANSFER via socket: {}", e.getMessage());
             }
+        };
+        if (preDelayMillis > 0) {
+            CompletableFuture.delayedExecutor(preDelayMillis, java.util.concurrent.TimeUnit.MILLISECONDS, TRANSFER_EXECUTOR)
+                    .execute(send);
+        } else {
+            TRANSFER_EXECUTOR.execute(send);
+        }
 
-            // Limpiar flag después de 6 segundos adicionales por si algo falla
-            try { Thread.sleep(6_000); } catch (InterruptedException ignored) {}
-            TRANSFERRING.remove(uuid);
-        });
+        // Red de seguridad: limpiar el flag pasados 6 s (agendado, sin bloquear ningún hilo)
+        CompletableFuture.delayedExecutor(preDelayMillis + 6_000, java.util.concurrent.TimeUnit.MILLISECONDS)
+                .execute(() -> TRANSFERRING.remove(uuid));
     }
 }

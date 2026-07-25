@@ -8,7 +8,9 @@ import com.cretania.invsync.network.SyncChannelHandler;
 import com.cretania.invsync.network.SyncPayload;
 import com.cretania.invsync.zone.PortalManager;
 import com.cretania.invsync.zone.ReturnZoneManager;
+import com.cretania.invsync.zone.RtpManager;
 import net.neoforged.api.distmarker.Dist;
+import net.neoforged.bus.api.EventPriority;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.loading.FMLEnvironment;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -17,6 +19,7 @@ import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.config.ModConfig;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.server.ServerStartingEvent;
+import net.neoforged.neoforge.event.server.ServerStoppedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.minecraft.server.MinecraftServer;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
@@ -46,7 +49,7 @@ public class CretaniaSync {
         instance = this;
         LOGGER.info("[Cretania] Inicializando sistema de sincronización Server-Side...");
 
-        // Registrar configuración del servidor
+        // Registrar configuración del servidor (mismo archivo de siempre).
         modContainer.registerConfig(ModConfig.Type.SERVER, SyncConfig.SPEC);
 
         // Instanciar componentes
@@ -66,6 +69,12 @@ public class CretaniaSync {
         NeoForge.EVENT_BUS.addListener(PortalManager::onServerTick);
         NeoForge.EVENT_BUS.addListener(PortalManager::onDimensionTravel);
         NeoForge.EVENT_BUS.addListener(PortalManager::onRegisterCommands);
+        // Portales RTP (bloques end_portal) → teletransporte aleatorio en el mismo mundo
+        NeoForge.EVENT_BUS.addListener(RtpManager::onServerTick);
+        NeoForge.EVENT_BUS.addListener(RtpManager::onDimensionTravel);
+        NeoForge.EVENT_BUS.addListener(RtpManager::onRegisterCommands);
+        // HIGHEST: debe devolver la gravedad ANTES de que InventorySync serialice el NBT.
+        NeoForge.EVENT_BUS.addListener(EventPriority.HIGHEST, RtpManager::onPlayerLogOut);
 
         // Registrar payload de red en el mod event bus
         modEventBus.addListener(this::onRegisterPayloads);
@@ -134,13 +143,32 @@ public class CretaniaSync {
         ReturnZoneManager.init(event.getServer());
         // Inicializar portales físicos (config/invsync-portals.toml)
         PortalManager.init(event.getServer());
+        // Inicializar portales RTP del End (config/invsync-rtp.toml)
+        RtpManager.init(event.getServer());
     }
 
     /**
-     * Al detener el servidor: cerrar conexión MongoDB.
+     * Al detener el servidor: guardar a TODOS los jugadores conectados, bloqueando hasta
+     * que las escrituras terminen.
+     *
+     * CRÍTICO — aquí NO se puede cerrar Mongo. Este evento se dispara ANTES de
+     * MinecraftServer#stopServer(), que es donde se expulsa a los jugadores y se disparan
+     * los PlayerLoggedOutEvent que guardan el inventario. Cerrar la base aquí (como se
+     * hacía antes) dejaba el executor apagado, los guardados del logout fallaban en
+     * silencio y CADA reinicio limpio perdía el progreso de todos los conectados.
+     * El cierre real ocurre en onServerStopped(), ya sin nada pendiente.
      */
     @SubscribeEvent
     public void onServerStopping(ServerStoppingEvent event) {
+        if (!dedicatedServer) return;
+        inventorySync.saveAllOnline("apagado del servidor", true);
+    }
+
+    /**
+     * Ya expulsados y guardados todos los jugadores: recién aquí se cierra la conexión.
+     */
+    @SubscribeEvent
+    public void onServerStopped(ServerStoppedEvent event) {
         databaseManager.shutdown();
         LOGGER.info("[Cretania] Sistema de sincronización detenido.");
     }

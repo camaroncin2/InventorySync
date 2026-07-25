@@ -63,11 +63,13 @@ import java.util.concurrent.CopyOnWriteArrayList;
  */
 public class PortalManager {
 
-    private static final int CHECK_INTERVAL    = 5;   // 0.25 s — throttle de la transferencia
     private static final int MAX_PORTAL_BLOCKS = 512; // tope del flood-fill
     private static final int SEARCH_RADIUS     = 4;   // radio de búsqueda del portal al crear
+    /** Radio (bloques) alrededor del portal en el que se congela el portal vanilla. */
+    private static final int PROXIMITY_RADIUS  = 4;
+    /** Cooldown vanilla que se refresca cada tick mientras el jugador esté cerca. */
+    private static final int VANILLA_COOLDOWN_TICKS = 40;
 
-    private static int tickCounter = 0;
     private static Path configPath;
 
     public record PortalDef(String name, String dimension,
@@ -91,6 +93,27 @@ public class PortalManager {
                     && pos.getX() >= minX - HITBOX_PADDING && pos.getX() <= maxX + HITBOX_PADDING
                     && pos.getY() >= minY - HITBOX_PADDING && pos.getY() <= maxY + HITBOX_PADDING
                     && pos.getZ() >= minZ - HITBOX_PADDING && pos.getZ() <= maxZ + HITBOX_PADDING;
+        }
+
+        /** True si la posición está a {@code radius} bloques o menos de la caja del portal. */
+        public boolean isNear(String dim, BlockPos pos, int radius) {
+            return dimension.equals(dim)
+                    && pos.getX() >= minX - radius && pos.getX() <= maxX + radius
+                    && pos.getY() >= minY - radius && pos.getY() <= maxY + radius
+                    && pos.getZ() >= minZ - radius && pos.getZ() <= maxZ + radius;
+        }
+
+        /**
+         * True si la hitbox del jugador TOCA físicamente los bloques del portal — el mismo
+         * criterio que usa vanilla en entityInside. Con esto el disparo es al contacto,
+         * no "cuando el centro de los pies cae en el bloque" (que tardaba medio paso más
+         * y fallaba en los bordes).
+         */
+        public boolean touches(String dim, net.minecraft.world.phys.AABB bb) {
+            return dimension.equals(dim)
+                    && bb.maxX > minX && bb.minX < maxX + 1
+                    && bb.maxY > minY && bb.minY < maxY + 1
+                    && bb.maxZ > minZ && bb.minZ < maxZ + 1;
         }
 
         public boolean hasTargetCoords() {
@@ -373,7 +396,7 @@ public class PortalManager {
     }
 
     // -------------------------------------------------------------------------
-    // Detección: jugador parado dentro de bloques de portal registrados
+    // Detección: contacto físico con los bloques de un portal registrado
     // -------------------------------------------------------------------------
 
     public static void onServerTick(ServerTickEvent.Post event) {
@@ -381,66 +404,61 @@ public class PortalManager {
 
         MinecraftServer server = event.getServer();
 
-        // Cada tick (sin throttle): mientras el jugador esté parado sobre bloques
-        // de un portal registrado, se le congela el contador de portal vanilla.
-        // Esto evita la carrera que a veces lo teletransportaba al Nether: sin
-        // esto, Entity#handlePortal() puede completar su cuenta e iniciar el
-        // cambio de dimensión vanilla ANTES de que la transferencia custom
-        // (que corre cada CHECK_INTERVAL ticks + delay async) llegue a moverlo.
+        // Cada tick, sin throttle. Dos responsabilidades por jugador:
+        //  1. Congelar el portal vanilla a todo el que esté CERCA (radio PROXIMITY_RADIUS)
+        //     de un portal registrado — no solo con los pies dentro. Vanilla dispara por
+        //     contacto de hitbox, así que rozar el bloque con el borde del cuerpo activaba
+        //     el viaje al Nether aunque el centro de los pies estuviera fuera. Congelando
+        //     por cercanía, el portal registrado queda 100% inhabilitado como portal real.
+        //  2. Disparar la transferencia al TOCAR el portal (mismo criterio de hitbox que
+        //     vanilla) — instantáneo, sin esperar a estar parado dentro.
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (player.isSpectator()) continue;
+
             BlockPos feet = player.blockPosition();
-            if (!player.level().getBlockState(feet).is(Blocks.NETHER_PORTAL)) continue;
-
             String dim = player.level().dimension().location().toString();
+
+            PortalDef touched = null;
+            boolean near = false;
             for (PortalDef p : PORTALS.values()) {
-                if (p.contains(dim, feet)) {
-                    player.setPortalCooldown();
-                    break;
-                }
+                if (!p.isNear(dim, feet, PROXIMITY_RADIUS)) continue;
+                near = true;
+                if (touched == null && p.touches(dim, player.getBoundingBox())) touched = p;
             }
-        }
+            if (!near) continue;
 
-        if (++tickCounter < CHECK_INTERVAL) return;
-        tickCounter = 0;
+            player.setPortalCooldown(VANILLA_COOLDOWN_TICKS);
 
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (touched == null) continue;
             if (ReturnZoneManager.isTransferring(player.getUUID())) continue;
 
-            BlockPos feet = player.blockPosition();
-            if (!player.level().getBlockState(feet).is(Blocks.NETHER_PORTAL)) continue;
+            PortalDef p = touched;
+            CretaniaSync.LOGGER.info("[Cretania-Portales] {} tocó el portal '{}' → {}",
+                    player.getGameProfile().getName(), p.name(), p.targetServer());
 
-            String dim = player.level().dimension().location().toString();
-            for (PortalDef p : PORTALS.values()) {
-                if (!p.contains(dim, feet)) continue;
+            // Destino literal e instantáneo: coords configuradas si existen,
+            // si no, el propio bloque del portal (sin RTP, sin búsqueda de terreno).
+            double tx = p.hasTargetCoords() ? p.targetX() : p.landingX();
+            double ty = p.hasTargetCoords() ? p.targetY() : p.landingY();
+            double tz = p.hasTargetCoords() ? p.targetZ() : p.landingZ();
+            float tyaw = p.targetYaw() != null ? p.targetYaw() : player.getYRot();
+            float tpitch = p.targetPitch() != null ? p.targetPitch() : player.getXRot();
 
-                CretaniaSync.LOGGER.info("[Cretania-Portales] {} entró al portal '{}' → {}",
-                        player.getGameProfile().getName(), p.name(), p.targetServer());
-
-                // Destino literal e instantáneo: coords configuradas si existen,
-                // si no, el propio bloque del portal (sin RTP, sin búsqueda de terreno).
-                double tx = p.hasTargetCoords() ? p.targetX() : p.landingX();
-                double ty = p.hasTargetCoords() ? p.targetY() : p.landingY();
-                double tz = p.hasTargetCoords() ? p.targetZ() : p.landingZ();
-                float tyaw = p.targetYaw() != null ? p.targetYaw() : player.getYRot();
-                float tpitch = p.targetPitch() != null ? p.targetPitch() : player.getXRot();
-
-                // Pseudo-servidor "local": TP dentro de este mismo server, sin pasar
-                // por Velocity (reemplaza a las antiguas zonas local_rtp).
-                if ("local".equalsIgnoreCase(p.targetServer())) {
-                    ReturnZoneManager.markTransferring(player.getUUID(), 8_000);
-                    player.displayClientMessage(Component.literal("Teletransportando...")
-                            .withStyle(ChatFormatting.LIGHT_PURPLE), true);
-                    com.cretania.invsync.network.SyncChannelHandler.applyTeleport(
-                            player, tx, ty, tz, tyaw, tpitch);
-                    break;
-                }
-
-                player.displayClientMessage(Component.literal("Conectando a " + p.targetServer() + "...")
+            // Pseudo-servidor "local": TP dentro de este mismo server, sin pasar
+            // por Velocity (reemplaza a las antiguas zonas local_rtp).
+            if ("local".equalsIgnoreCase(p.targetServer())) {
+                ReturnZoneManager.markTransferring(player.getUUID(), 8_000);
+                player.displayClientMessage(Component.literal("Teletransportando...")
                         .withStyle(ChatFormatting.LIGHT_PURPLE), true);
-
-                ReturnZoneManager.initiateReturnImmediate(player, p.targetServer(), tx, ty, tz, tyaw, tpitch);
-                break;
+                com.cretania.invsync.network.SyncChannelHandler.applyTeleport(
+                        player, tx, ty, tz, tyaw, tpitch);
+                continue;
             }
+
+            player.displayClientMessage(Component.literal("Conectando a " + p.targetServer() + "...")
+                    .withStyle(ChatFormatting.LIGHT_PURPLE), true);
+
+            ReturnZoneManager.initiateReturnImmediate(player, p.targetServer(), tx, ty, tz, tyaw, tpitch);
         }
     }
 

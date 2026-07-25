@@ -18,6 +18,8 @@ import net.neoforged.neoforge.client.event.ScreenEvent;
  *  3. La espera de CLIENT_AUTH/hasJoined (típicamente 1-3 s) que ahora se hace tras
  *     el spawn (Velocity ya no fetchea Mojang en el handshake).
  *
+ * Solo aplica en multijugador: en un mundo singleplayer (o abierto a LAN) no se muestra.
+ *
  * Renderiza:
  *  - Imagen fullscreen `assets/cretania_client/textures/gui/loading_background.png`
  *    (recomendado 1920x1080 PNG, se estira a la ventana).
@@ -39,6 +41,13 @@ public class ServerTransitionOverlay {
     private static long stateStartMs    = 0;
     private static long holdDurationMs  = 0;
 
+    /**
+     * True desde que arranca la conexión a un servidor hasta que se vuelve a un menú.
+     * Durante el "Connecting / Joining world…" todavía no hay jugador ni mundo, así que
+     * no sirve mirar mc.player para saber si el overlay debe pintarse.
+     */
+    private static boolean sessionActive = false;
+
     /** Cache: ¿existe el asset de imagen? Se evalúa la primera vez y se cachea. */
     private static Boolean bgAssetExists = null;
 
@@ -55,11 +64,28 @@ public class ServerTransitionOverlay {
         holdDurationMs = holdMs;
     }
 
+    /** Oculta el overlay al instante. */
+    private static void hide() {
+        state = 0;
+    }
+
+    /** True si estamos en un mundo local (singleplayer o abierto a LAN). */
+    private static boolean isSingleplayer() {
+        return Minecraft.getInstance().hasSingleplayerServer();
+    }
+
     private static float currentAlpha() {
         if (state == 0) return 0f;
         long elapsed = System.currentTimeMillis() - stateStartMs;
         switch (state) {
-            case 1: return Math.min(1f, elapsed / (float) FADE_IN_MS);
+            case 1:
+                // Al terminar el fade-in hay que pasar a hold. Sin esto el estado 1 no
+                // tenía salida y el overlay se quedaba a alpha 1 para siempre.
+                if (elapsed >= FADE_IN_MS) {
+                    enterState(2, holdDurationMs);
+                    return 1f;
+                }
+                return elapsed / (float) FADE_IN_MS;
             case 2:
                 if (elapsed >= holdDurationMs) enterState(3, 0);
                 return 1f;
@@ -67,7 +93,9 @@ public class ServerTransitionOverlay {
                 float a = Math.max(0f, 1f - elapsed / (float) FADE_OUT_MS);
                 if (a <= 0f) state = 0;
                 return a;
-            default: return 0f;
+            default:
+                state = 0;
+                return 0f;
         }
     }
 
@@ -75,35 +103,57 @@ public class ServerTransitionOverlay {
 
     @SubscribeEvent
     public static void onLoggingIn(ClientPlayerNetworkEvent.LoggingIn event) {
-        // Primer login al servidor o cambio de server: mostrar overlay full-screen
-        // hasta que la pantalla de carga (Downloading terrain) se cierre.
+        if (isSingleplayer()) {
+            sessionActive = false;
+            hide();
+            return;
+        }
+        // Primer login al servidor o cambio de server. Con Velocity el cambio de backend no
+        // reabre ConnectScreen: llega directamente otro LoggingIn, y este es el único aviso.
+        sessionActive = true;
         enterState(2, HOLD_MAX_MS);
     }
 
     @SubscribeEvent
     public static void onLoggingOut(ClientPlayerNetworkEvent.LoggingOut event) {
-        enterState(1, 0); // fade-in (cambio de server o desconexión)
+        // Desconexión real: volvemos al menú, hay que ocultar. Con Velocity el cambio de
+        // servidor NO dispara este evento (la conexión al proxy se mantiene y llega otro
+        // LoggingIn), así que aquí nunca hace falta mostrar nada.
+        sessionActive = false;
+        hide();
     }
 
     @SubscribeEvent
     public static void onScreenClose(ScreenEvent.Closing event) {
-        if (state == 2) {
-            String name = event.getScreen().getClass().getSimpleName();
-            if (name.contains("Level") || name.contains("Receiving") || name.contains("Loading")
-                    || name.contains("Connect")) {
-                // Mundo cargado: pequeño extra para que el spawn termine de cargar chunks
-                enterState(2, 600L);
-            }
+        if (state != 2) return;
+        String name = event.getScreen().getClass().getSimpleName();
+        // Terreno ya recibido → dejar un extra corto y fundir a salida.
+        // OJO: NO incluir ConnectScreen. Se cierra cuando ARRANCA la carga de terreno, no
+        // cuando termina; acortar el hold ahí destaparía justo la parte que queremos cubrir.
+        if (name.contains("ReceivingLevel") || name.contains("LevelLoading")) {
+            enterState(2, 600L);
         }
     }
 
     @SubscribeEvent
     public static void onScreenOpen(ScreenEvent.Opening event) {
-        if (state != 0) {
-            String name = event.getScreen().getClass().getSimpleName();
-            if (name.contains("Title") || name.contains("MainMenu") || name.contains("Disconnect")) {
-                enterState(3, 0); // volver al menú: fade-out inmediato
-            }
+        String name = event.getScreen().getClass().getSimpleName();
+
+        // Arranca la conexión a un servidor: cubrir desde ya el "Connecting… / Joining
+        // world…" de vanilla, que ocurre antes de que exista jugador y mundo.
+        if (!isSingleplayer() && name.contains("Connect") && !name.contains("Disconnect")) {
+            sessionActive = true;
+            enterState(2, HOLD_MAX_MS);
+            return;
+        }
+
+        // Pantallas de menú: fin de sesión, ocultar de inmediato (un fade-out encima
+        // taparía la UI). Al desconectar se vuelve a JoinMultiplayerScreen, no a Title.
+        if (name.contains("Title") || name.contains("MainMenu") || name.contains("Disconnect")
+                || name.contains("Multiplayer") || name.contains("Realms")
+                || name.contains("SelectWorld")) {
+            sessionActive = false;
+            hide();
         }
     }
 
@@ -122,6 +172,16 @@ public class ServerTransitionOverlay {
     // ── Dibujo ────────────────────────────────────────────────────────────────
 
     private static void drawOverlay(GuiGraphics g) {
+        if (state == 0) return;
+
+        // Fuera de una sesión de multijugador el overlay no pinta nada y taparía la UI.
+        // No se puede usar mc.player aquí: durante la conexión todavía es null y es
+        // justamente cuando hay que cubrir.
+        if (!sessionActive || isSingleplayer()) {
+            hide();
+            return;
+        }
+
         float alpha = currentAlpha();
         if (alpha <= 0.005f) return;
 
@@ -152,10 +212,11 @@ public class ServerTransitionOverlay {
             g.pose().popPose();
         }
 
-        // Subtítulo de estado en la parte inferior
+        // Subtítulo de estado en la parte inferior. Hasta que existe el jugador seguimos
+        // en la fase de conexión; a partir de ahí el cliente ya está recibiendo el mundo.
         int subAlpha = (int) (alpha * 200f);
         if (subAlpha > 5) {
-            String sub = state == 2 ? "Cargando mundo…" : "Conectando al servidor…";
+            String sub = mc.player == null ? "Conectando al servidor…" : "Cargando mundo…";
             g.drawCenteredString(mc.font, sub, w / 2, h - 30,
                     (subAlpha << 24) | 0xCCCCCC);
         }

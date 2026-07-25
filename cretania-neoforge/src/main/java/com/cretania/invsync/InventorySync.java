@@ -37,10 +37,110 @@ public class InventorySync {
 
     private final DatabaseManager databaseManager;
     private final Map<UUID, String> pendingProxyDecision = new ConcurrentHashMap<>();
+    /**
+     * Jugadores cuya carga desde Mongo falló. Su inventario en memoria NO es el bueno,
+     * así que guardarlo sobrescribiría los datos correctos que siguen en la base.
+     */
+    private final java.util.Set<UUID> loadFailed = ConcurrentHashMap.newKeySet();
     private MinecraftServer server;
+    private int autosaveTicker = 0;
 
     public InventorySync(DatabaseManager databaseManager) {
         this.databaseManager = databaseManager;
+    }
+
+    // -------------------------------------------------------------------------
+    // Guardado: autosave periódico + guardado total al apagar
+    // -------------------------------------------------------------------------
+
+    /**
+     * Autoguardado periódico. Es la única protección real contra un crash duro
+     * (kill -9, OOM, corte de luz): en esos casos no se dispara ni el logout ni el
+     * apagado, así que sin esto se perdería todo lo hecho desde el último login.
+     */
+    @SubscribeEvent
+    public void onServerTick(net.neoforged.neoforge.event.tick.ServerTickEvent.Post event) {
+        int seconds = SyncConfig.INSTANCE.autosaveSeconds.get();
+        if (seconds <= 0) return;
+        if (++autosaveTicker < seconds * 20) return;
+        autosaveTicker = 0;
+        saveAllOnline("autosave", false);
+    }
+
+    /**
+     * Guarda a todos los jugadores conectados. Con {@code blocking=true} espera a que las
+     * escrituras terminen — obligatorio al apagar, porque justo después se cierra Mongo.
+     */
+    public void saveAllOnline(String reason, boolean blocking) {
+        MinecraftServer srv = CretaniaSync.getInstance().getServer();
+        if (srv == null || !databaseManager.isConnected()) return;
+        String scope = configuredScope();
+        if (scope.isBlank()) return; // este server no comparte inventario
+
+        String serverName = configuredServerName();
+        List<CompletableFuture<Void>> futures = new java.util.ArrayList<>();
+        for (ServerPlayer player : srv.getPlayerList().getPlayers()) {
+            UUID uuid = player.getUUID();
+            // Carga en curso: su inventario todavía no es el suyo definitivo.
+            if (SyncStateManager.isLocked(uuid)) continue;
+            if (loadFailed.contains(uuid)) continue;
+            try {
+                futures.add(databaseManager.savePlayerData(uuid, player.getGameProfile().getName(),
+                        snapshot(player), serverName, scope));
+            } catch (Exception e) {
+                CretaniaSync.LOGGER.error("[Cretania] Error serializando a {} durante {}: {}",
+                        player.getGameProfile().getName(), reason, e.toString());
+            }
+        }
+        if (futures.isEmpty()) return;
+
+        if (!blocking) {
+            CretaniaSync.LOGGER.debug("[Cretania] {} ({} jugadores).", reason, futures.size());
+            return;
+        }
+
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .get(SyncConfig.INSTANCE.syncTimeoutSeconds.get(), TimeUnit.SECONDS);
+            CretaniaSync.LOGGER.info("[Cretania] {} inventario(s) guardado(s) ({}).", futures.size(), reason);
+        } catch (Exception e) {
+            CretaniaSync.LOGGER.error("[Cretania] FALLO guardando inventarios ({}): {}", reason, e.toString());
+        }
+    }
+
+    /** Serializa el estado actual del jugador. Debe llamarse en el server thread. */
+    private String snapshot(ServerPlayer player) {
+        CompoundTag tag = new CompoundTag();
+        player.saveWithoutId(tag);
+        return NbtSerializer.toBase64(tag);
+    }
+
+    /**
+     * Punto de aparición de un login normal (el jugador NO viene por un portal).
+     * Según config: el spawn del mundo (/setworldspawn) o unas coords fijas.
+     */
+    private void applyLoginSpawn(ServerPlayer player) {
+        String name = player.getGameProfile().getName();
+
+        if (SyncConfig.INSTANCE.forcedSpawnUseWorldSpawn.get()) {
+            ServerLevel level = player.serverLevel();
+            var spawn = level.getSharedSpawnPos();
+            SyncChannelHandler.applyTeleport(player,
+                    spawn.getX() + 0.5, spawn.getY(), spawn.getZ() + 0.5,
+                    level.getSharedSpawnAngle(), 0f);
+            CretaniaSync.LOGGER.info("[Cretania] Login spawn (spawn del mundo) aplicado a {} → ({},{},{})",
+                    name, spawn.getX(), spawn.getY(), spawn.getZ());
+            return;
+        }
+
+        double fx = SyncConfig.INSTANCE.forcedSpawnX.get();
+        double fy = SyncConfig.INSTANCE.forcedSpawnY.get();
+        double fz = SyncConfig.INSTANCE.forcedSpawnZ.get();
+        float fyaw = SyncConfig.INSTANCE.forcedSpawnYaw.get().floatValue();
+        float fpitch = SyncConfig.INSTANCE.forcedSpawnPitch.get().floatValue();
+        SyncChannelHandler.applyTeleport(player, fx, fy, fz, fyaw, fpitch);
+        CretaniaSync.LOGGER.info("[Cretania] Login spawn (coords fijas) aplicado a {} → ({},{},{}) yaw={} pitch={}",
+                name, fx, fy, fz, fyaw, fpitch);
     }
 
     @SubscribeEvent
@@ -51,6 +151,13 @@ public class InventorySync {
         // Notificar a Velocity que el backend tiene al jugador registrado.
         // Velocity responde inmediatamente con skin + auth — sin delays fijos.
         SyncChannelHandler.sendPlayerReady(player);
+
+        // "Catch-up": applyPlayerSkin() solo avisa a quienes YA estaban online en el
+        // momento del cambio. Un jugador que se conecta DESPUÉS de que otros ya tienen
+        // su skin aplicada nunca recibe ese aviso — quedaba dependiendo únicamente del
+        // paquete estándar de Minecraft (que puede no traer la firma a tiempo). Por eso
+        // le mandamos ahora el SkinClientPayload de cada jugador ya conectado.
+        sendExistingSkinsTo(player);
 
         if (!databaseManager.isConnected()) {
             handleDatabaseUnavailable(player);
@@ -81,28 +188,26 @@ public class InventorySync {
             }
         });
 
-        // Forced spawn: si está habilitado, ignora SET_POSITION pendiente y TP a coords fijas.
-        // Aplica a TODO el mundo: login, /server, transfer de zona, comando.
-        if (SyncConfig.INSTANCE.forcedSpawnEnabled.get()) {
-            // Limpiar cualquier pending SET_POSITION para que no se aplique más tarde.
-            SyncChannelHandler.PENDING_TELEPORTS.remove(player.getUUID());
-            double fx = SyncConfig.INSTANCE.forcedSpawnX.get();
-            double fy = SyncConfig.INSTANCE.forcedSpawnY.get();
-            double fz = SyncConfig.INSTANCE.forcedSpawnZ.get();
-            float fyaw = SyncConfig.INSTANCE.forcedSpawnYaw.get().floatValue();
-            float fpitch = SyncConfig.INSTANCE.forcedSpawnPitch.get().floatValue();
-            SyncChannelHandler.applyTeleport(player, fx, fy, fz, fyaw, fpitch);
-            CretaniaSync.LOGGER.info("[Cretania] Forced spawn aplicado a {} → ({},{},{}) yaw={} pitch={}",
-                    player.getGameProfile().getName(), fx, fy, fz, fyaw, fpitch);
-        } else {
-            // Aplicar posición pendiente de zona (transferencia lobby→tiendas/minijuegos).
-            // Se ejecuta aquí porque PlayerLoggedInEvent garantiza que el jugador está en el mundo.
-            double[] pendingPos = SyncChannelHandler.PENDING_TELEPORTS.remove(player.getUUID());
-            if (pendingPos != null) {
-                SyncChannelHandler.applyTeleport(player,
-                        pendingPos[0], pendingPos[1], pendingPos[2],
-                        (float) pendingPos[3], (float) pendingPos[4]);
-            }
+        // Posición al entrar, por prioridad:
+        //  1. Por portal: el server de origen manda las coords vía SET_POSITION. Velocity las
+        //     envía ~100 ms después del login (normalmente aún no llegaron aquí); cuando llegan
+        //     se aplican encima. El jugador sigue en la pantalla de carga, no se ve el salto.
+        //  2. restoreLastPositionOnLogin (survival): la última posición guardada. Se maneja en
+        //     applyPlayerData porque necesita el documento de Mongo, que carga async.
+        //  3. forced_spawn (lobby): spawn del mundo o coords fijas.
+        //  4. Nada → se queda donde vanilla lo puso (su playerdata local).
+        //
+        // ANTES forced_spawn borraba el SET_POSITION pendiente y se imponía siempre: por eso
+        // las llegadas por portal terminaban en el punto de login en vez de en el del portal.
+        double[] pendingPos = SyncChannelHandler.PENDING_TELEPORTS.remove(player.getUUID());
+        if (pendingPos != null) {
+            SyncChannelHandler.markPortalArrival(player.getUUID());
+            SyncChannelHandler.applyTeleport(player,
+                    pendingPos[0], pendingPos[1], pendingPos[2],
+                    (float) pendingPos[3], (float) pendingPos[4]);
+        } else if (!SyncConfig.INSTANCE.restoreLastPositionOnLogin.get()
+                && SyncConfig.INSTANCE.forcedSpawnEnabled.get()) {
+            applyLoginSpawn(player);
         }
 
         String scope = configuredScope();
@@ -122,9 +227,42 @@ public class InventorySync {
         SyncStateManager.lock(uuid);
         player.displayClientMessage(net.minecraft.network.chat.Component.literal("§eCargando tu inventario..."), true);
         // Cargamos directamente desde MongoDB sin esperar al coordinador Velocity.
-        // El logout usa .join() (bloquea) así que el save siempre termina antes
-        // de que el jugador llegue al siguiente servidor — no hay race condition.
         loadPlayerFromDatabase(player, scope);
+    }
+
+    /**
+     * Manda al jugador recién conectado el SkinClientPayload de cada jugador que ya
+     * estaba online, usando su GameProfile actual (ya tiene la textura correcta,
+     * venga de Mojang o de MongoDB). Sin esto, el recién llegado depende únicamente
+     * del paquete estándar de player-info, cuyo resultado queda memoizado para
+     * siempre en el cliente si no llega la firma a tiempo — ver applyPlayerSkin().
+     */
+    private void sendExistingSkinsTo(ServerPlayer newPlayer) {
+        MinecraftServer srv = newPlayer.getServer();
+        if (srv == null) return;
+
+        int sent = 0;
+        for (ServerPlayer other : srv.getPlayerList().getPlayers()) {
+            if (other.getUUID().equals(newPlayer.getUUID())) continue;
+
+            var textures = other.getGameProfile().getProperties().get("textures");
+            if (textures.isEmpty()) continue;
+            Property prop = textures.iterator().next();
+
+            try {
+                newPlayer.connection.send(new ClientboundCustomPayloadPacket(
+                        new SkinClientPayload(other.getUUID(), prop.value(),
+                                prop.hasSignature() ? prop.signature() : "")));
+                sent++;
+            } catch (Exception e) {
+                CretaniaSync.LOGGER.warn("[Cretania-Skin] Error mandando catch-up de skin de {} a {}: {}",
+                        other.getGameProfile().getName(), newPlayer.getGameProfile().getName(), e.getMessage());
+            }
+        }
+        if (sent > 0) {
+            CretaniaSync.LOGGER.info("[Cretania-Skin] Catch-up: {} skin(s) existentes enviadas a {}",
+                    sent, newPlayer.getGameProfile().getName());
+        }
     }
 
     @SubscribeEvent
@@ -144,12 +282,18 @@ public class InventorySync {
             return;
         }
 
-        CompoundTag playerData = new CompoundTag();
-        player.saveWithoutId(playerData);
-        String base64Data = NbtSerializer.toBase64(playerData);
-
-        String serverName = configuredServerName();
         String playerName = player.getGameProfile().getName();
+
+        // Si su carga falló, lo que tiene en memoria no es su inventario real: guardarlo
+        // pisaría los datos buenos que siguen en Mongo.
+        if (loadFailed.remove(uuid)) {
+            CretaniaSync.LOGGER.warn("[Cretania] NO se guarda el inventario de {}: su carga había fallado y "
+                    + "sobrescribiría los datos correctos en la base.", playerName);
+            return;
+        }
+
+        String base64Data = snapshot(player);
+        String serverName = configuredServerName();
 
         databaseManager.savePlayerData(uuid, playerName, base64Data, serverName, scope)
                 .orTimeout(SyncConfig.INSTANCE.syncTimeoutSeconds.get(), TimeUnit.SECONDS)
@@ -224,11 +368,26 @@ public class InventorySync {
             try {
                 PlayerPositionSnapshot position = PlayerPositionSnapshot.capture(player);
                 CompoundTag loadedData = NbtSerializer.fromBase64(optionalData.get());
+                // Leer la posición guardada ANTES de removerla — puede ser la última
+                // desconexión que restauraremos abajo (survival).
+                SavedPosition savedPos = readSavedPosition(loadedData, player.getServer());
                 stripPositionData(loadedData);
                 player.load(loadedData);
                 position.restore(player);
                 player.inventoryMenu.broadcastChanges();
                 player.refreshDimensions();
+                loadFailed.remove(uuid);
+
+                // Restaurar la última posición SOLO si este server lo pide y NO llegó por portal
+                // (el portal ya fijó su posición y tiene prioridad). Usa el dato guardado en Mongo,
+                // no el playerdata local de vanilla, así funciona aunque vanilla lo haya reseteado.
+                if (SyncConfig.INSTANCE.restoreLastPositionOnLogin.get()
+                        && !SyncChannelHandler.cameFromPortal(uuid)
+                        && savedPos != null) {
+                    savedPos.applyTo(player);
+                    CretaniaSync.LOGGER.info("[Cretania] {} restaurado a su última posición ({}, {}, {}).",
+                            playerName, (int) savedPos.x(), (int) savedPos.y(), (int) savedPos.z());
+                }
                 CretaniaSync.LOGGER.info("[Cretania] Datos cargados exitosamente para: {} scope={}", playerName, scope);
             } catch (Exception e) {
                 CretaniaSync.LOGGER.error("[Cretania] Error aplicando NBT a {} scope={}: {}", playerName, scope, e.getMessage());
@@ -236,8 +395,14 @@ public class InventorySync {
                 return;
             }
         } else {
-            CretaniaSync.LOGGER.info("[Cretania] Sin datos previos para {} scope={}.", playerName, scope);
-            clearInventoryIfConfigured(player, "empty_scope_data");
+            // NO borrar. Sin documento en Mongo, el inventario que el jugador ya tiene
+            // cargado (su playerdata local) es su estado real — típicamente tras un crash
+            // en el que el guardado no llegó a la base. Borrarlo aquí era una vía directa
+            // de pérdida de datos; en su lugar se sube ese estado a Mongo para inicializarlo.
+            loadFailed.remove(uuid);
+            CretaniaSync.LOGGER.warn("[Cretania] Sin datos previos para {} scope={} — se CONSERVA su inventario local y se sube a Mongo.",
+                    playerName, scope);
+            databaseManager.savePlayerData(uuid, playerName, snapshot(player), configuredServerName(), scope);
         }
 
         player.displayClientMessage(net.minecraft.network.chat.Component.literal("§a¡Listo!"), true);
@@ -276,10 +441,49 @@ public class InventorySync {
         pendingProxyDecision.remove(uuid);
         SyncStateManager.unlock(uuid);
         SyncVisuals.removeLoadingVisuals(player);
+        // Marcarlo para NO guardarlo después: su inventario en memoria no es el bueno y
+        // guardarlo pisaría los datos correctos que siguen en Mongo.
+        loadFailed.add(uuid);
 
         if (SyncConfig.INSTANCE.kickOnFailure.get()) {
             player.connection.disconnect(Component.literal("§c[Cretania] Error de sincronizacion. Por favor, reconectate."));
         }
+    }
+
+    /** Posición guardada en el NBT del jugador (última desconexión), ya resuelta a su nivel. */
+    private record SavedPosition(ServerLevel level, double x, double y, double z, float yaw, float pitch) {
+        void applyTo(ServerPlayer player) {
+            player.teleportTo(level, x, y, z, yaw, pitch);
+            player.setDeltaMovement(net.minecraft.world.phys.Vec3.ZERO);
+            player.resetFallDistance();
+        }
+    }
+
+    /**
+     * Lee Pos/Rotation/Dimension del NBT guardado. Devuelve null si no hay posición válida
+     * (p. ej. el primer login del jugador, cuando el documento aún no tenía posición).
+     */
+    private SavedPosition readSavedPosition(CompoundTag data, MinecraftServer srv) {
+        if (srv == null) return null;
+        var posTag = data.getList("Pos", net.minecraft.nbt.Tag.TAG_DOUBLE);
+        if (posTag.size() < 3) return null;
+        double x = posTag.getDouble(0), y = posTag.getDouble(1), z = posTag.getDouble(2);
+
+        float yaw = 0f, pitch = 0f;
+        var rotTag = data.getList("Rotation", net.minecraft.nbt.Tag.TAG_FLOAT);
+        if (rotTag.size() >= 2) { yaw = rotTag.getFloat(0); pitch = rotTag.getFloat(1); }
+
+        // Dimensión guardada; si no resuelve, usa el overworld del server.
+        ServerLevel level = null;
+        if (data.contains("Dimension", net.minecraft.nbt.Tag.TAG_STRING)) {
+            var id = net.minecraft.resources.ResourceLocation.tryParse(data.getString("Dimension"));
+            if (id != null) {
+                level = srv.getLevel(net.minecraft.resources.ResourceKey.create(
+                        net.minecraft.core.registries.Registries.DIMENSION, id));
+            }
+        }
+        if (level == null) level = srv.overworld();
+        return new SavedPosition(level, x, y, z, yaw, pitch);
     }
 
     private void stripPositionData(CompoundTag data) {

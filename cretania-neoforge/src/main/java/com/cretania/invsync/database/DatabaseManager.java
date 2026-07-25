@@ -15,6 +15,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 public class DatabaseManager {
 
@@ -24,6 +25,8 @@ public class DatabaseManager {
     private MongoClient mongoClient;
     private MongoCollection<Document> collection;
     private MongoCollection<Document> skinsCollection;
+    /** Una vez cerrado no se aceptan más escrituras: isConnected() debe reflejarlo. */
+    private volatile boolean closed = false;
     private final ExecutorService executor = Executors.newFixedThreadPool(4, r -> {
         Thread t = new Thread(r, "Cretania-DB-Worker");
         t.setDaemon(true);
@@ -75,8 +78,21 @@ public class DatabaseManager {
         }, executor);
     }
 
+    /**
+     * Cierra la conexión. OJO: debe llamarse SOLO cuando ya no queda nada por guardar
+     * (ServerStoppedEvent), nunca antes de que los jugadores hayan sido guardados.
+     */
     public void shutdown() {
+        closed = true;
         executor.shutdown();
+        try {
+            // Dar margen a las escrituras ya encoladas antes de cortar la conexión.
+            if (!executor.awaitTermination(15, TimeUnit.SECONDS)) {
+                CretaniaSync.LOGGER.warn("[Cretania] Quedaron escrituras a MongoDB sin terminar al cerrar.");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
         if (mongoClient != null) {
             mongoClient.close();
         }
@@ -84,7 +100,7 @@ public class DatabaseManager {
     }
 
     public boolean isConnected() {
-        return mongoClient != null && collection != null;
+        return !closed && mongoClient != null && collection != null;
     }
 
     // ─────────────────────────── Skins ────────────────────────────
@@ -114,6 +130,18 @@ public class DatabaseManager {
         if (skinsCollection == null) return CompletableFuture.completedFuture(null);
         return CompletableFuture.runAsync(() -> {
             try {
+                // Una skin sin firma ("cracked") NUNCA sobrescribe un documento "premium":
+                // era la vía por la que las skins premium desaparecían de la base tras
+                // reinicios (una caché/launcher re-enviaba la versión sin firma y pisaba
+                // la firmada). La skin premium solo la actualiza otra skin firmada.
+                if (!"premium".equals(type)) {
+                    Document existing = skinsCollection.find(Filters.eq("_id", uuid.toString())).first();
+                    if (existing != null && "premium".equals(existing.getString("type"))) {
+                        CretaniaSync.LOGGER.info("[Cretania-Skin] Skin sin firma de {} ignorada — no sobrescribe la skin premium guardada.",
+                                username);
+                        return;
+                    }
+                }
                 Document doc = new Document("_id", uuid.toString())
                         .append("name", username)
                         .append("value", value)
